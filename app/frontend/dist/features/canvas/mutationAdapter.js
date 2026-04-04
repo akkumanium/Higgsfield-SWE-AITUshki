@@ -1,4 +1,15 @@
-import { toRichText } from 'tldraw';
+function toRichText(text) {
+    const trimmed = text.trim();
+    return {
+        type: 'doc',
+        content: [
+            {
+                type: 'paragraph',
+                content: trimmed.length > 0 ? [{ type: 'text', text }] : undefined,
+            },
+        ],
+    };
+}
 function createOperationId(prefix) {
     return `shape:${prefix}-${Math.random().toString(36).slice(2, 10)}`;
 }

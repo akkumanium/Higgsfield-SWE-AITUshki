@@ -1,4 +1,4 @@
-import { streamClaudeTurn } from './agent/claudeClient.js';
+import { streamGeminiTurn } from './agent/claudeClient.js';
 import type { AgentTurnRequest, AgentTurnResponse, FailureEnvelope } from './types/contracts.js';
 
 const defaultMinTurnIntervalMs = 5_000;
@@ -48,7 +48,7 @@ export function isAgentTurnRequest(value: unknown): value is AgentTurnRequest {
 }
 
 export async function handleAgentTurn(request: AgentTurnRequest) {
-  return streamClaudeTurn(request);
+  return streamGeminiTurn(request);
 }
 
 export const backendPort = 3001;

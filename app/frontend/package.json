@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit"
+    "check": "tsc -p tsconfig.json --noEmit",
+    "dev": "vite --host localhost --port 5173 --strictPort",
+    "preview": "vite preview --host localhost --port 4173 --strictPort"
   },
   "dependencies": {
     "@ai-canvas/shared": "workspace:*",
@@ -13,7 +15,9 @@
     "tldraw": "^3.8.0"
   },
   "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
     "@types/react": "^18.3.12",
-    "@types/react-dom": "^18.3.1"
+    "@types/react-dom": "^18.3.1",
+    "vite": "^6.1.0"
   }
 }

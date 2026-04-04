@@ -2,13 +2,11 @@
   "name": "ai-canvas-mvp",
   "private": true,
   "scripts": {
+    "predev": "node ./scripts/kill-dev-ports.mjs",
     "build": "tsc -b app/shared app/frontend app/backend app/sync-server app/e2e",
     "check": "tsc -b --pretty false",
-    "smoke": "npm run smoke -w @ai-canvas/e2e",
-    "dev": "npm run build && concurrently -k \"npm run dev:backend\" \"npm run dev:sync\" \"npm run dev:frontend\"",
-    "dev:frontend": "npm run dev -w @ai-canvas/frontend",
-    "dev:backend": "npm run start -w @ai-canvas/backend",
-    "dev:sync": "npm run start -w @ai-canvas/sync-server"
+    "smoke": "pnpm --filter @ai-canvas/e2e smoke",
+    "dev": "pnpm run build && concurrently -k \"pnpm --filter @ai-canvas/backend start\" \"pnpm --filter @ai-canvas/sync-server start\" \"pnpm --filter @ai-canvas/frontend dev\""
   },
   "devDependencies": {
     "concurrently": "^9.1.2",

@@ -1,4 +1,4 @@
-import { streamClaudeTurn } from './agent/claudeClient.js';
+import { streamGeminiTurn } from './agent/claudeClient.js';
 const defaultMinTurnIntervalMs = 5_000;
 const defaultMaxActionsPerTurn = 50;
 const lastTurnBySession = new Map();
@@ -36,7 +36,7 @@ export function isAgentTurnRequest(value) {
         typeof value.context.maxShapes === 'number');
 }
 export async function handleAgentTurn(request) {
-    return streamClaudeTurn(request);
+    return streamGeminiTurn(request);
 }
 export const backendPort = 3001;
 export function createBackendHealth() {

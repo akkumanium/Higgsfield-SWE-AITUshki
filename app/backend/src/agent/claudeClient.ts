@@ -80,16 +80,42 @@ function buildShapeContextText(request: AgentTurnRequest): string {
 function buildFallbackSummaryText(request: AgentTurnRequest): string {
   const previews = getContextShapePreviews(request);
   if (previews.length === 0) {
-    return 'No visible shapes to summarize yet. Add notes or objects in the viewport and ask again for a focused summary.';
+    return 'No visible shapes to summarize. Add content to the canvas first.';
   }
 
   const textual = previews.filter((shape) => shape.text.length > 0).map((shape) => shape.text);
-  const topIdeas = textual.slice(0, 4);
-  if (topIdeas.length === 0) {
-    return `Found ${previews.length} visible shapes, but they do not contain readable text. Add short labels to shapes for a richer summary.`;
+
+  const kindCounts = previews.reduce<Record<string, number>>((accumulator, shape) => {
+    accumulator[shape.kind] = (accumulator[shape.kind] ?? 0) + 1;
+    return accumulator;
+  }, {});
+
+  const kindSummary = Object.entries(kindCounts)
+    .map(([kind, count]) => `${count} ${kind}${count > 1 ? 's' : ''}`)
+    .join(', ');
+
+  if (textual.length === 0) {
+    return `Canvas contains ${kindSummary} with no text labels yet.`;
   }
 
-  return `Summary (${previews.length} shapes): ${topIdeas.join(' | ')}`;
+  return `${previews.length} shapes (${kindSummary}): ${textual.slice(0, 4).join(' | ')}`;
+}
+
+function extractNoteText(prompt: string): string {
+  const patterns = [
+    /make a note (?:saying|that|:)\s+["']?(.+?)["']?$/i,
+    /add a (?:sticky )?note (?:saying|that|:)\s+["']?(.+?)["']?$/i,
+    /(?:write|put|place)(?: a note)?(?:\s+saying|:)?\s+["']?(.+?)["']?$/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = prompt.match(pattern);
+    if (match?.[1]) {
+      return match[1].trim();
+    }
+  }
+
+  return prompt;
 }
 
 function toFunctionDeclaration(schema: ReturnType<typeof getToolSchemas>[number]): GeminiToolDeclaration {
@@ -181,7 +207,7 @@ function toFunctionDeclaration(schema: ReturnType<typeof getToolSchemas>[number]
   };
 }
 
-function inferToolPlan(request: AgentTurnRequest): Array<{ toolName: ToolName; arguments: Record<string, unknown> }> {
+function inferToolPlanHeuristic(request: AgentTurnRequest): Array<{ toolName: ToolName; arguments: Record<string, unknown> }> {
   const prompt = request.prompt.toLowerCase();
   const viewport = request.context.viewport;
 
@@ -253,7 +279,7 @@ function inferToolPlan(request: AgentTurnRequest): Array<{ toolName: ToolName; a
       arguments: {
         x: viewport.x + viewport.width / 2,
         y: viewport.y + viewport.height / 2,
-        text: request.prompt,
+        text: extractNoteText(request.prompt),
       },
     },
   ];
@@ -323,7 +349,7 @@ async function inferToolPlanFromGemini(
 ): Promise<Array<{ toolName: ToolName; arguments: Record<string, unknown> }>> {
   const apiKey = getConfiguredApiKey();
   if (!apiKey) {
-    return inferToolPlan(request);
+    return inferToolPlanHeuristic(request);
   }
 
   const timeoutMs = getConfiguredTimeoutMs();
@@ -359,6 +385,7 @@ async function inferToolPlanFromGemini(
                   `Viewport: ${JSON.stringify(request.context.viewport)}`,
                   buildShapeContextText(request),
                   'If you choose summarize_region, include a concise, useful summary in the "summary" field (2-4 sentences).',
+                  "For place_sticky, 'text' must contain ONLY the note content the user wants placed on the canvas - never their instruction. If asked \"make a note saying X\", text = \"X\".",
                   'Do not return placeholder text or coordinate-only summaries.',
                   'Choose the single best tool call for this turn unless multiple are absolutely required.',
                 ].join('\n'),
@@ -371,7 +398,7 @@ async function inferToolPlanFromGemini(
     });
 
     if (!response.ok) {
-      return inferToolPlan(request);
+      return inferToolPlanHeuristic(request);
     }
 
     const parsed = (await response.json()) as GeminiResponse;
@@ -396,9 +423,9 @@ async function inferToolPlanFromGemini(
       ];
     });
 
-    return plannedTools.length > 0 ? plannedTools : inferToolPlan(request);
+    return plannedTools.length > 0 ? plannedTools : inferToolPlanHeuristic(request);
   } catch {
-    return inferToolPlan(request);
+    return inferToolPlanHeuristic(request);
   } finally {
     clearTimeout(timer);
   }
@@ -413,7 +440,11 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
     },
   ];
 
-  const maxToolsPerTurn = Number(getEnv('AGENT_MAX_TOOLS_PER_TURN') ?? defaultMaxToolsPerTurn);
+  const configuredMaxToolsPerTurn = Number(getEnv('AGENT_MAX_TOOLS_PER_TURN') ?? defaultMaxToolsPerTurn);
+  const maxToolsPerTurn =
+    Number.isFinite(configuredMaxToolsPerTurn) && configuredMaxToolsPerTurn > 0
+      ? Math.floor(configuredMaxToolsPerTurn)
+      : defaultMaxToolsPerTurn;
   const toolPlan = (await inferToolPlanFromGemini(request)).filter((entry) => isKnownToolName(entry.toolName));
 
   if (toolPlan.length > maxToolsPerTurn) {

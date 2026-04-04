@@ -1,5 +1,32 @@
 import type { CanvasActionEnvelope } from '@ai-canvas/shared';
-import { toRichText } from 'tldraw';
+
+type RichTextNode = {
+  type: 'text';
+  text: string;
+};
+
+type RichTextParagraph = {
+  type: 'paragraph';
+  content?: RichTextNode[];
+};
+
+type RichTextDocument = {
+  type: 'doc';
+  content: RichTextParagraph[];
+};
+
+function toRichText(text: string): RichTextDocument {
+  const trimmed = text.trim();
+  return {
+    type: 'doc',
+    content: [
+      {
+        type: 'paragraph',
+        content: trimmed.length > 0 ? [{ type: 'text', text }] : undefined,
+      },
+    ],
+  };
+}
 
 export interface CanvasMutationOperation {
   kind: 'create' | 'update' | 'delete' | 'batch';

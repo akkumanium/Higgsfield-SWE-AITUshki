@@ -1,6 +1,6 @@
-import type { AgentTurnRequest } from './types/contracts.js';
+import type { AgentTurnRequest, AgentTurnResponse } from './types/contracts.js';
 export declare function isAgentTurnRequest(value: unknown): value is AgentTurnRequest;
-export declare function handleAgentTurn(request: AgentTurnRequest): Promise<any>;
+export declare function handleAgentTurn(request: AgentTurnRequest): Promise<AgentTurnResponse>;
 export declare const backendPort = 3001;
 export declare function createBackendHealth(): {
     status: "ok";
