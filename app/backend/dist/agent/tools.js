@@ -62,7 +62,7 @@ export function validateToolArguments(toolName, arguments_) {
 }
 export function createToolEnvelope(turnId, toolName, arguments_) {
     return {
-        id: `${turnId}:${toolName}:${Date.now()}`,
+        id: `${turnId}:${toolName}:${crypto.randomUUID()}`,
         turnId,
         toolName,
         arguments: arguments_,

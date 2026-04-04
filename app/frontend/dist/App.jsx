@@ -8,6 +8,7 @@ import { createSyncConnection } from './features/sync/syncClient.js';
 export const defaultRoomId = 'demo-room';
 export const defaultSessionId = 'demo-session';
 const maxCreateOperationsPerAgentTurn = 50;
+const maxAppliedRemoteActionIds = 2_000;
 function createId(prefix) {
     return `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
 }
@@ -328,6 +329,7 @@ export function App(root, options = {}) {
     let lastTriggerAt = 0;
     let isAgentRequestInFlight = false;
     let inFlightController = null;
+    const appliedRemoteActionIds = new Set();
     const setAgentUiState = (busy, status, error = '') => {
         isAgentRequestInFlight = busy;
         statusLine.textContent = status;
@@ -405,6 +407,16 @@ export function App(root, options = {}) {
     const applyRemote = (action) => {
         if (!editor) {
             return;
+        }
+        if (appliedRemoteActionIds.has(action.id)) {
+            return;
+        }
+        appliedRemoteActionIds.add(action.id);
+        if (appliedRemoteActionIds.size > maxAppliedRemoteActionIds) {
+            const oldestActionId = appliedRemoteActionIds.values().next().value;
+            if (typeof oldestActionId === 'string') {
+                appliedRemoteActionIds.delete(oldestActionId);
+            }
         }
         const plan = applyCanvasAction(action);
         const createOperationCount = plan.operations.filter((operation) => operation.kind === 'create').length;

@@ -83,7 +83,7 @@ export function createToolEnvelope(
   arguments_: Record<string, unknown>,
 ): ToolCallEnvelope {
   return {
-    id: `${turnId}:${toolName}:${Date.now()}`,
+    id: `${turnId}:${toolName}:${crypto.randomUUID()}`,
     turnId,
     toolName,
     arguments: arguments_,
