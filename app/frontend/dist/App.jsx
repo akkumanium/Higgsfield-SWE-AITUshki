@@ -277,6 +277,18 @@ export function App(root, options = {}) {
     statusLine.style.marginTop = '8px';
     statusLine.style.fontSize = '12px';
     statusLine.style.color = '#475569';
+    const chatOutput = document.createElement('div');
+    chatOutput.style.marginTop = '8px';
+    chatOutput.style.maxHeight = '120px';
+    chatOutput.style.overflowY = 'auto';
+    chatOutput.style.padding = '8px';
+    chatOutput.style.border = '1px solid #cbd5e1';
+    chatOutput.style.borderRadius = '8px';
+    chatOutput.style.background = '#f8fafc';
+    chatOutput.style.fontSize = '12px';
+    chatOutput.style.color = '#0f172a';
+    chatOutput.style.whiteSpace = 'pre-wrap';
+    chatOutput.style.wordBreak = 'break-word';
     const errorLine = document.createElement('div');
     errorLine.style.marginTop = '6px';
     errorLine.style.fontSize = '12px';
@@ -320,6 +332,7 @@ export function App(root, options = {}) {
     overlay.appendChild(triggerButton);
     overlay.appendChild(cancelButton);
     overlay.appendChild(statusLine);
+    overlay.appendChild(chatOutput);
     overlay.appendChild(errorLine);
     overlay.appendChild(helper);
     root.appendChild(overlay);
@@ -338,6 +351,16 @@ export function App(root, options = {}) {
         triggerButton.style.opacity = busy ? '0.65' : '1';
         triggerButton.style.cursor = busy ? 'default' : 'pointer';
         cancelButton.style.display = busy ? 'block' : 'none';
+    };
+    const resetAgentChatText = () => {
+        chatOutput.textContent = '';
+    };
+    const appendAgentChatText = (delta) => {
+        if (delta.length === 0) {
+            return;
+        }
+        chatOutput.textContent = `${chatOutput.textContent ?? ''}${delta}`;
+        chatOutput.scrollTop = chatOutput.scrollHeight;
     };
     setAgentUiState(false, 'Ready', '');
     const appRoot = createRoot(mountNode);
@@ -534,6 +557,7 @@ export function App(root, options = {}) {
         };
         const controller = new AbortController();
         inFlightController = controller;
+        resetAgentChatText();
         setAgentUiState(true, 'Agent running...', '');
         try {
             const response = await fetch(`${backendUrl}/agent/turn`, {
@@ -551,6 +575,10 @@ export function App(root, options = {}) {
             }
             const parsed = await parseSseResponse(response);
             for (const streamEvent of parsed.events) {
+                if (streamEvent.type === 'agent.stream.delta') {
+                    appendAgentChatText(streamEvent.delta);
+                    continue;
+                }
                 if (streamEvent.type !== 'agent.stream.action') {
                     continue;
                 }

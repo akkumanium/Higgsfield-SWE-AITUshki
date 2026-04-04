@@ -34,23 +34,35 @@ const completedToolCalls = (response.events ?? [])
     .map((event) => event.toolCall);
 const placeStickyCalls = completedToolCalls.filter((call) => call.toolName === 'place_sticky');
 const arrowCalls = completedToolCalls.filter((call) => call.toolName === 'draw_arrow');
-const clusterCalls = completedToolCalls.filter((call) => call.toolName === 'cluster_shapes');
-assert(placeStickyCalls.length === 5, 'must emit exactly 5 place_sticky calls');
-assert(arrowCalls.length >= 2, 'must emit at least 2 draw_arrow calls');
-assert(clusterCalls.length === 1, 'must emit exactly 1 cluster_shapes call');
-const stickyIds = new Set(placeStickyCalls
-    .map((call) => call.arguments.id)
-    .filter((value) => typeof value === 'string' && value.length > 0));
+assert(placeStickyCalls.length > 0, 'plan must contain at least one node (place_sticky call)');
+const minX = request.context.viewport.x;
+const minY = request.context.viewport.y;
+const maxX = request.context.viewport.x + request.context.viewport.width;
+const maxY = request.context.viewport.y + request.context.viewport.height;
+const nodeById = new Map();
+for (const sticky of placeStickyCalls) {
+    const id = sticky.arguments.id;
+    const text = sticky.arguments.text;
+    const x = sticky.arguments.x;
+    const y = sticky.arguments.y;
+    assert(typeof id === 'string' && id.length > 0, 'node id must be a non-empty string');
+    assert(typeof text === 'string' && text.trim().length > 0, 'node text must be a non-empty string');
+    assert(typeof x === 'number' && Number.isFinite(x), 'node x must be a finite number');
+    assert(typeof y === 'number' && Number.isFinite(y), 'node y must be a finite number');
+    assert(x >= minX && x <= maxX, 'node x must be inside viewport bounds');
+    assert(y >= minY && y <= maxY, 'node y must be inside viewport bounds');
+    const keyMatch = id.match(/^shape-[^-]+-(.+)$/);
+    assert(keyMatch !== null && keyMatch[1].length > 0, 'node id must include a stable key suffix');
+    const key = keyMatch[1];
+    assert(![...nodeById.values()].some((node) => node.key === key), 'node keys must be unique');
+    nodeById.set(id, { id, key, text, x, y });
+}
 for (const arrow of arrowCalls) {
     const fromShapeId = arrow.arguments.fromShapeId;
     const toShapeId = arrow.arguments.toShapeId;
-    assert(typeof fromShapeId === 'string' && stickyIds.has(fromShapeId), 'arrow source must reference a sticky ID');
-    assert(typeof toShapeId === 'string' && stickyIds.has(toShapeId), 'arrow target must reference a sticky ID');
-}
-const clusterShapeIds = clusterCalls[0]?.arguments.shapeIds;
-assert(Array.isArray(clusterShapeIds), 'cluster shapeIds must be an array');
-for (const shapeId of clusterShapeIds) {
-    assert(typeof shapeId === 'string' && stickyIds.has(shapeId), 'cluster member must reference a sticky ID');
+    assert(typeof fromShapeId === 'string' && nodeById.has(fromShapeId), 'edge source must reference an existing node key');
+    assert(typeof toShapeId === 'string' && nodeById.has(toShapeId), 'edge target must reference an existing node key');
+    assert(fromShapeId !== toShapeId, 'edge must not self-reference');
 }
 const maxToolsPerTurn = Number(env.AGENT_MAX_TOOLS_PER_TURN ?? '6');
 assert(completedToolCalls.length <= maxToolsPerTurn, 'tool calls must respect AGENT_MAX_TOOLS_PER_TURN');
