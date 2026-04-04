@@ -6,5 +6,12 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@ai-canvas/shared": "workspace:*",
+    "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3"
   }
 }

@@ -17,6 +17,62 @@ export interface SyncConnectionState {
   error?: string;
 }
 
+export interface SyncClientJoinMessage {
+  type: 'join';
+  roomId: RoomId;
+  sessionId: SessionId;
+}
+
+export interface SyncClientActionMessage {
+  type: 'action';
+  roomId: RoomId;
+  sessionId: SessionId;
+  action: CanvasActionEnvelope;
+}
+
+export interface SyncClientPresencePingMessage {
+  type: 'presence.ping';
+  roomId: RoomId;
+  sessionId: SessionId;
+  at: string;
+}
+
+export type SyncClientMessage =
+  | SyncClientJoinMessage
+  | SyncClientActionMessage
+  | SyncClientPresencePingMessage;
+
+export interface SyncServerSnapshotMessage {
+  type: 'room.snapshot';
+  roomId: RoomId;
+  actions: CanvasActionEnvelope[];
+  connectedClients: number;
+}
+
+export interface SyncServerActionMessage {
+  type: 'room.action';
+  roomId: RoomId;
+  action: CanvasActionEnvelope;
+}
+
+export interface SyncServerPresenceMessage {
+  type: 'room.presence';
+  roomId: RoomId;
+  connectedClients: number;
+}
+
+export interface SyncServerErrorMessage {
+  type: 'error';
+  roomId: RoomId;
+  message: string;
+}
+
+export type SyncServerMessage =
+  | SyncServerSnapshotMessage
+  | SyncServerActionMessage
+  | SyncServerPresenceMessage
+  | SyncServerErrorMessage;
+
 export type CanvasShapeKind = 'text' | 'sticky' | 'arrow' | 'cluster' | 'image' | 'unknown';
 
 export interface CanvasShapeBounds {
