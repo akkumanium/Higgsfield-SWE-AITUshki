@@ -14,7 +14,7 @@ import { createToolEnvelope } from './tools.js';
 const geminiApiBaseUrl = 'https://generativelanguage.googleapis.com/v1beta';
 const defaultGeminiModel = 'gemini-2.5-flash';
 const defaultTimeoutMs = 20_000;
-const defaultMaxToolsPerTurn = 6;
+const defaultMaxToolsPerTurn = 15;
 const defaultMaxOutputTokens = 4096;
 
 interface ContextShapePreview {
