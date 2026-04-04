@@ -1,12 +1,17 @@
 {
   "name": "ai-canvas-mvp",
   "private": true,
-  "workspaces": [
-    "app/*"
-  ],
   "scripts": {
     "build": "tsc -b app/shared app/frontend app/backend app/sync-server app/e2e",
     "check": "tsc -b --pretty false",
-    "smoke": "npm run smoke -w @ai-canvas/e2e"
+    "smoke": "npm run smoke -w @ai-canvas/e2e",
+    "dev": "npm run build && concurrently -k \"npm run dev:backend\" \"npm run dev:sync\" \"npm run dev:frontend\"",
+    "dev:frontend": "npm run dev -w @ai-canvas/frontend",
+    "dev:backend": "npm run start -w @ai-canvas/backend",
+    "dev:sync": "npm run start -w @ai-canvas/sync-server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.0.0"
   }
 }

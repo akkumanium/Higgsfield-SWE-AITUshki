@@ -1,0 +1,11 @@
+{
+  "name": "@ai-canvas/shared",
+  "private": true,
+  "type": "module",
+  "main": "src/contracts.ts",
+  "types": "src/contracts.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit"
+  }
+}
