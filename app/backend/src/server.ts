@@ -1,4 +1,5 @@
 import { streamGeminiTurn } from './agent/claudeClient.js';
+import { getHiggsfieldGenerationStatus } from './agent/higgsfieldClient.js';
 import type { AgentTurnRequest, AgentTurnResponse, FailureEnvelope } from './types/contracts.js';
 
 const defaultMinTurnIntervalMs = 5_000;
@@ -120,6 +121,24 @@ function writeSseEvent(response: RuntimeResponse, event: string, data: unknown) 
   response.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
+function parseMediaStatusRequestId(url: string | undefined): string | null {
+  if (!url) {
+    return null;
+  }
+
+  const path = url.split('?')[0] ?? '';
+  const match = path.match(/^\/media\/requests\/([^/]+)\/status$/i);
+  if (!match?.[1]) {
+    return null;
+  }
+
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return match[1];
+  }
+}
+
 function parseJsonBody(text: string): unknown {
   if (text.trim().length === 0) {
     return null;
@@ -172,6 +191,25 @@ export async function startBackendServer(options: StartBackendServerOptions = {}
     if (request.method === 'GET' && request.url === '/health') {
       writeJson(response, 200, createBackendHealth());
       return;
+    }
+
+    if (request.method === 'GET') {
+      const requestId = parseMediaStatusRequestId(request.url);
+      if (requestId) {
+        try {
+          const status = await getHiggsfieldGenerationStatus(requestId);
+          writeJson(response, 200, {
+            ...status,
+          });
+        } catch (error) {
+          writeJson(response, 502, {
+            requestId,
+            status: 'failed',
+            error: error instanceof Error ? error.message : 'Failed to fetch media generation status.',
+          });
+        }
+        return;
+      }
     }
 
     if (request.method === 'POST' && request.url === '/agent/turn') {

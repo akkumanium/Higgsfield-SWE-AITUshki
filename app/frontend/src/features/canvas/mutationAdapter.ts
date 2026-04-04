@@ -86,6 +86,85 @@ function toUniqueShapeIds(value: unknown): string[] {
   return [...new Set(ids)];
 }
 
+function buildMediaPlaceholderOperations(
+  arguments_: Record<string, unknown>,
+  mediaType: 'image' | 'video',
+): CanvasMutationOperation[] {
+  const id = toShapeId(arguments_.id, `agent-${mediaType}-placeholder`);
+  const prompt = toStringValue(arguments_.prompt, `Untitled ${mediaType}`);
+  const status = toStringValue(arguments_.status, 'queued');
+  const requestId = toStringValue(arguments_.requestId, '');
+  const errorMessage = toStringValue(arguments_.errorMessage, '');
+
+  const statusLabel =
+    status === 'completed'
+      ? 'ready'
+      : status === 'failed' || status === 'nsfw'
+        ? 'failed'
+        : 'pending';
+
+  const terminalLine =
+    errorMessage.length > 0
+      ? `\nError: ${errorMessage}`
+      : status === 'completed'
+        ? '\nStatus: completed'
+        : status === 'nsfw'
+          ? '\nStatus: blocked (nsfw)'
+          : '';
+
+  const placeholderText =
+    mediaType === 'video'
+      ? `Video generation (${statusLabel}): ${prompt}${terminalLine}`
+      : `Image generation (${statusLabel}): ${prompt}${terminalLine}`;
+
+  const centerX = clampNumber(arguments_.x, -5000, 5000, 260);
+  const centerY = clampNumber(arguments_.y, -5000, 5000, 210);
+
+  return [
+    {
+      kind: 'create',
+      targetIds: [id],
+      payload: {
+        shapeInput: {
+          id,
+          type: 'note',
+          x: centerX - STICKY_W / 2,
+          y: centerY - STICKY_H / 2,
+          props: {
+            richText: toRichText(placeholderText),
+            color: mediaType === 'video' ? 'light-blue' : 'light-green',
+          },
+          meta: {
+            agentText: placeholderText,
+            agentMedia: {
+              provider: toStringValue(arguments_.provider, 'higgsfield'),
+              mediaType,
+              prompt,
+              requestId,
+              status,
+              statusUrl: toStringValue(arguments_.statusUrl, ''),
+              cancelUrl: toStringValue(arguments_.cancelUrl, ''),
+              imageUrl: toStringValue(arguments_.imageUrl, ''),
+              videoUrl: toStringValue(arguments_.videoUrl, ''),
+              submittedAt: toStringValue(arguments_.submittedAt, new Date().toISOString()),
+              errorMessage,
+            },
+          },
+        },
+        mediaRequest:
+          requestId.length > 0
+            ? {
+                requestId,
+                mediaType,
+                shapeId: id,
+                status,
+              }
+            : undefined,
+      },
+    },
+  ];
+}
+
 function mapToolPayloadToOperations(action: CanvasActionEnvelope): CanvasMutationOperation[] {
   const toolName = typeof action.payload.toolName === 'string' ? action.payload.toolName : '';
   const arguments_ =
@@ -255,7 +334,7 @@ function mapToolPayloadToOperations(action: CanvasActionEnvelope): CanvasMutatio
               end: { x: 0, y: 0 },
               arrowheadEnd: 'arrow',
               arrowheadStart: 'none',
-              ...(label.length > 0 ? { richText: toRichText(label) } : {}),
+              ...(label.length > 0 ? { text: label } : {}),
             },
           },
           bindings: [
@@ -350,28 +429,11 @@ function mapToolPayloadToOperations(action: CanvasActionEnvelope): CanvasMutatio
   }
 
   if (toolName === 'generate_image') {
-    const placeholderText = `Image placeholder: ${toStringValue(arguments_.prompt, 'Untitled image')}`;
-    const id = createOperationId('agent-image-placeholder');
-    return [
-      {
-        kind: 'create',
-        targetIds: [id],
-        payload: {
-          shapeInput: {
-            id,
-            type: 'note',
-            x: clampNumber(arguments_.x, -5000, 5000, 260),
-            y: clampNumber(arguments_.y, -5000, 5000, 210),
-            props: {
-              richText: toRichText(placeholderText),
-            },
-            meta: {
-              agentText: placeholderText,
-            },
-          },
-        },
-      },
-    ];
+    return buildMediaPlaceholderOperations(arguments_, 'image');
+  }
+
+  if (toolName === 'generate_video') {
+    return buildMediaPlaceholderOperations(arguments_, 'video');
   }
 
   return [];

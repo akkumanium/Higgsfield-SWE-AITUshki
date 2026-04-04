@@ -45,7 +45,12 @@ const BASE_TOOL_SCHEMAS = [
     {
         name: 'generate_image',
         description: 'Create a placeholder for an asynchronously generated image.',
-        requiredKeys: ['prompt', 'x', 'y'],
+        requiredKeys: ['id', 'prompt', 'x', 'y'],
+    },
+    {
+        name: 'generate_video',
+        description: 'Create a placeholder for an asynchronously generated video.',
+        requiredKeys: ['id', 'prompt', 'x', 'y'],
     },
 ];
 function getEnv(name) {
@@ -53,14 +58,17 @@ function getEnv(name) {
     return maybeProcess?.env?.[name];
 }
 export function isToolEnabled(toolName) {
-    if (toolName !== 'generate_image') {
+    if (toolName !== 'generate_image' && toolName !== 'generate_video') {
         return true;
     }
     const flag = getEnv('ENABLE_STRETCH_FEATURES');
     if (!flag) {
-        return false;
+        return true;
     }
     const normalized = flag.trim().toLowerCase();
+    if (['0', 'false', 'no', 'off'].includes(normalized)) {
+        return false;
+    }
     return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
 }
 export function getToolSchemas() {

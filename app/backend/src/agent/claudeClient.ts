@@ -21,6 +21,8 @@ const defaultGeminiModel = 'gemini-2.5-flash';
 const defaultTimeoutMs = 45_000;
 const defaultMaxToolsPerTurn = 20;
 const defaultMaxOutputTokens = 8192;
+const plannerDebugFlag = 'AGENT_PLANNER_DEBUG';
+const plannerDebugDefaultEnabled = true;
 
 // Default sticky dimensions (note shape)
 const STICKY_W = 200;
@@ -32,6 +34,61 @@ const DEFAULT_GEO_H = 80;
 const MAX_NODE_TEXT = 300;
 const MAX_MESSAGE_TEXT = 2000;
 const MAX_NODES_HARD = 32;
+const MAX_MEDIA_HARD = 8;
+const MAX_VALIDATION_TRACE_ISSUES = 120;
+
+type PlannerLogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+function isPlannerDebugEnabled(): boolean {
+  const value = getEnv(plannerDebugFlag);
+  if (!value) return plannerDebugDefaultEnabled;
+  const normalized = value.trim().toLowerCase();
+  return !['0', 'false', 'no', 'off'].includes(normalized);
+}
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return JSON.stringify({ unserializable: true, stringValue: String(value) });
+  }
+}
+
+function serializeError(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+  return {
+    message: String(error),
+  };
+}
+
+function logPlanner(level: PlannerLogLevel, event: string, payload: Record<string, unknown>): void {
+  const shouldLog = isPlannerDebugEnabled() || level === 'warn' || level === 'error';
+  if (!shouldLog) return;
+
+  const line = safeJson({
+    scope: 'planner',
+    level,
+    event,
+    at: new Date().toISOString(),
+    ...payload,
+  });
+
+  if (level === 'error') {
+    console.error(line);
+    return;
+  }
+  if (level === 'warn') {
+    console.warn(line);
+    return;
+  }
+  console.log(line);
+}
 
 // ---------------------------------------------------------------------------
 // AIPlan contract
@@ -88,6 +145,19 @@ export interface AIPlanCluster {
   label?: string;          // optional group label
 }
 
+export type AIMediaType = 'image' | 'video';
+
+export interface AIPlanMediaRequest {
+  key: string;
+  mediaType: AIMediaType;
+  prompt: string;
+  x: number;
+  y: number;
+  aspectRatio?: string;
+  resolution?: string;
+  modelId?: string;
+}
+
 export interface AIPlan {
   message?: string;        // conversational reply (omit when drawing)
   nodes: AIPlanNode[];
@@ -95,6 +165,7 @@ export interface AIPlan {
   updates?: AIPlanUpdate[];
   deletes?: AIPlanDelete[];
   clusters?: AIPlanCluster[];
+  media?: AIPlanMediaRequest[];
 }
 
 // Internal tool call
@@ -472,6 +543,17 @@ Use "clusters" to group related shapes so they move together.
 - For grouping existing content, use exact ids from canvas context.
 
 ═══════════════════════════════════════════
+MEDIA GENERATION — Higgsfield jobs
+═══════════════════════════════════════════
+Use "media" for generated assets when the user asks to create an image or a video.
+- mediaType: "image" or "video"
+- key: unique short id for this media request
+- prompt: exact generation prompt
+- x/y: center position for the placeholder card on canvas
+- Optional tuning fields: aspectRatio, resolution, modelId
+- Do not also add a sticky that duplicates the same media request.
+
+═══════════════════════════════════════════
 OUTPUT SCHEMA
 ═══════════════════════════════════════════
 {
@@ -496,6 +578,18 @@ OUTPUT SCHEMA
   ],
   "clusters": [
     { "shapeIds": ["<node_key_or_shape_id>", "<node_key_or_shape_id>"], "label": "<optional>" }
+  ],
+  "media": [
+    {
+      "key": "<unique_media_key>",
+      "mediaType": "image|video",
+      "prompt": "<generation prompt>",
+      "x": <number>,
+      "y": <number>,
+      "aspectRatio": "<optional, e.g. 16:9>",
+      "resolution": "<optional, e.g. 720p>",
+      "modelId": "<optional model id>"
+    }
   ]
 }
 
@@ -503,12 +597,13 @@ OUTPUT SCHEMA
 RULES
 ═══════════════════════════════════════════
 - Maximum 12 new nodes per turn.
+- Maximum 4 media requests per turn.
 - Node text: short and specific — no filler words.
 - Edges: only reference keys that exist in your nodes list.
 - Conversational mode (user is chatting, not asking for canvas content):
-  set nodes=[], edges=[], omit updates/deletes/clusters, put reply in "message".
+  set nodes=[], edges=[], omit updates/deletes/clusters/media, put reply in "message".
 - Canvas mode: omit "message" entirely.
-- You can mix creates + updates + deletes + clusters in one response.
+- You can mix creates + updates + deletes + clusters + media in one response.
 - Do not invent shape IDs for updates/deletes — use exact ids from the canvas context.
 
 ═══════════════════════════════════════════
@@ -599,8 +694,38 @@ Prompt: "group onboarding notes together" →
   ]
 }
 
+Prompt: "generate a cover image for my roadmap" →
+{
+  "nodes": [],
+  "edges": [],
+  "media": [
+    {
+      "key": "roadmap_cover",
+      "mediaType": "image",
+      "prompt": "cinematic product roadmap cover, clean typography, teal and orange accents",
+      "x": ${cx},
+      "y": ${cy}
+    }
+  ]
+}
+
+Prompt: "create a short launch teaser video" →
+{
+  "nodes": [],
+  "edges": [],
+  "media": [
+    {
+      "key": "launch_teaser",
+      "mediaType": "video",
+      "prompt": "fast-paced product launch teaser, dynamic camera movement, modern office aesthetic",
+      "x": ${cx},
+      "y": ${cy}
+    }
+  ]
+}
+
 Prompt: "what can you do?" →
-{ "nodes": [], "edges": [], "message": "I can create timelines, flowcharts, mind maps, comparison grids, and free-form notes. I can also add arrows between shapes, add text headings, and edit or delete shapes already on the canvas. What would you like to build?" }
+{ "nodes": [], "edges": [], "message": "I can create timelines, flowcharts, mind maps, comparison grids, and free-form notes. I can add arrows, headings, update/delete existing shapes, and trigger image or video generation jobs on request. What would you like to build?" }
 `.trim();
 }
 
@@ -685,14 +810,99 @@ function stripMarkdownFences(value: string): string {
   return match?.[1] !== undefined ? match[1].trim() : trimmed;
 }
 
+interface PlanValidationTrace {
+  rawInputType: string;
+  inputCounts: {
+    nodes: number;
+    edges: number;
+    updates: number;
+    deletes: number;
+    clusters: number;
+    media: number;
+  };
+  acceptedCounts: {
+    nodes: number;
+    edges: number;
+    updates: number;
+    deletes: number;
+    clusters: number;
+    media: number;
+  };
+  droppedNodes: string[];
+  droppedEdges: string[];
+  droppedUpdates: string[];
+  droppedDeletes: string[];
+  droppedClusters: string[];
+  droppedMedia: string[];
+  outcome: 'canvas' | 'conversational' | 'invalid';
+  invalidReason?: string;
+}
+
+function createPlanValidationTrace(raw: unknown): PlanValidationTrace {
+  return {
+    rawInputType: Array.isArray(raw) ? 'array' : typeof raw,
+    inputCounts: {
+      nodes: 0,
+      edges: 0,
+      updates: 0,
+      deletes: 0,
+      clusters: 0,
+      media: 0,
+    },
+    acceptedCounts: {
+      nodes: 0,
+      edges: 0,
+      updates: 0,
+      deletes: 0,
+      clusters: 0,
+      media: 0,
+    },
+    droppedNodes: [],
+    droppedEdges: [],
+    droppedUpdates: [],
+    droppedDeletes: [],
+    droppedClusters: [],
+    droppedMedia: [],
+    outcome: 'invalid',
+  };
+}
+
+function pushTraceIssue(target: string[], message: string): void {
+  if (target.length >= MAX_VALIDATION_TRACE_ISSUES) return;
+  target.push(message);
+}
+
 function sanitizeAndValidatePlan(
   raw: unknown,
   viewport: AgentTurnRequest['context']['viewport'],
   maxNodes: number,
   contextShapes: ContextShapeLayout[] = [],
+  trace?: PlanValidationTrace,
 ): AIPlan | null {
-  if (typeof raw !== 'object' || raw === null) return null;
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    if (trace) {
+      trace.outcome = 'invalid';
+      trace.invalidReason = 'Raw planner payload is not a JSON object.';
+    }
+    return null;
+  }
   const obj = raw as Record<string, unknown>;
+
+  const rawNodes = Array.isArray(obj.nodes) ? obj.nodes : [];
+  const rawEdges = Array.isArray(obj.edges) ? obj.edges : [];
+  const rawUpdates = Array.isArray(obj.updates) ? obj.updates : [];
+  const rawDeletes = Array.isArray(obj.deletes) ? obj.deletes : [];
+  const rawClusters = Array.isArray(obj.clusters) ? obj.clusters : [];
+  const rawMedia = Array.isArray(obj.media) ? obj.media : [];
+
+  if (trace) {
+    trace.inputCounts.nodes = rawNodes.length;
+    trace.inputCounts.edges = rawEdges.length;
+    trace.inputCounts.updates = rawUpdates.length;
+    trace.inputCounts.deletes = rawDeletes.length;
+    trace.inputCounts.clusters = rawClusters.length;
+    trace.inputCounts.media = rawMedia.length;
+  }
 
   const message =
     typeof obj.message === 'string' && obj.message.trim().length > 0
@@ -706,7 +916,6 @@ function sanitizeAndValidatePlan(
   const maxY = y + height - STICKY_H / 2 - 20;
 
   // ── Nodes ──────────────────────────────────────────────────────────────────
-  const rawNodes = Array.isArray(obj.nodes) ? obj.nodes : [];
   const seenKeys = new Set<string>();
   const placedNodes: AIPlanNode[] = [];
   const occupiedContextBoxes: OccupiedBox[] = contextShapes.map((shape) => ({
@@ -717,23 +926,41 @@ function sanitizeAndValidatePlan(
     hh: Math.max(1, shape.height / 2),
   }));
 
-  for (const n of rawNodes.slice(0, Math.min(MAX_NODES_HARD, maxNodes))) {
-    if (typeof n !== 'object' || n === null) continue;
+  const maxAcceptedNodes = Math.min(MAX_NODES_HARD, maxNodes);
+  rawNodes.slice(0, maxAcceptedNodes).forEach((n, index) => {
+    if (typeof n !== 'object' || n === null) {
+      if (trace) pushTraceIssue(trace.droppedNodes, `nodes[${index}] ignored: not an object.`);
+      return;
+    }
+
     const nr = n as Record<string, unknown>;
 
     const rawKey = typeof nr.key === 'string' ? nr.key.trim() : '';
     const key = normalizeKey(rawKey);
-    if (key.length === 0 || seenKeys.has(key)) continue;
+    if (key.length === 0) {
+      if (trace) pushTraceIssue(trace.droppedNodes, `nodes[${index}] ignored: missing/invalid key.`);
+      return;
+    }
+    if (seenKeys.has(key)) {
+      if (trace) pushTraceIssue(trace.droppedNodes, `nodes[${index}] ignored: duplicate key '${key}'.`);
+      return;
+    }
 
     const rawType = typeof nr.type === 'string' ? nr.type.trim().toLowerCase() : 'sticky';
     const type: NodeType = VALID_NODE_TYPES.has(rawType) ? (rawType as NodeType) : 'sticky';
 
     const text = typeof nr.text === 'string' ? truncate(nr.text.trim(), MAX_NODE_TEXT) : '';
-    if (text.length === 0) continue;
+    if (text.length === 0) {
+      if (trace) pushTraceIssue(trace.droppedNodes, `nodes[${index}] ignored: missing/empty text.`);
+      return;
+    }
 
     const rawX = typeof nr.x === 'number' ? nr.x : null;
     const rawY = typeof nr.y === 'number' ? nr.y : null;
-    if (rawX === null || rawY === null || !Number.isFinite(rawX) || !Number.isFinite(rawY)) continue;
+    if (rawX === null || rawY === null || !Number.isFinite(rawX) || !Number.isFinite(rawY)) {
+      if (trace) pushTraceIssue(trace.droppedNodes, `nodes[${index}] ignored: x/y must be finite numbers.`);
+      return;
+    }
 
     const color =
       typeof nr.color === 'string' && VALID_COLORS.has(nr.color) ? (nr.color as ShapeColor) : undefined;
@@ -756,33 +983,51 @@ function sanitizeAndValidatePlan(
       node.h = Math.round(clamp(rawH, 30, 400));
     }
 
-    const resolved = findNonCollidingPosition(node, placedNodes, viewport, 20, 24, occupiedContextBoxes);
+    const contextBoxesForNode = node.type === 'text' ? [] : occupiedContextBoxes;
+    const resolved = findNonCollidingPosition(node, placedNodes, viewport, 20, 24, contextBoxesForNode);
     node = { ...node, x: resolved.x, y: resolved.y };
 
     seenKeys.add(key);
     placedNodes.push(node);
+  });
+
+  if (trace && rawNodes.length > maxAcceptedNodes) {
+    pushTraceIssue(
+      trace.droppedNodes,
+      `${rawNodes.length - maxAcceptedNodes} extra node(s) ignored due to max node budget (${maxAcceptedNodes}).`,
+    );
   }
 
   // ── Edges ──────────────────────────────────────────────────────────────────
-  const rawEdges = Array.isArray(obj.edges) ? obj.edges : [];
-  const edges: AIPlanEdge[] = rawEdges
-    .map((e): AIPlanEdge | null => {
-      if (typeof e !== 'object' || e === null) return null;
-      const er = e as Record<string, unknown>;
-      const from = normalizeKey(typeof er.from === 'string' ? er.from : '');
-      const to = normalizeKey(typeof er.to === 'string' ? er.to : '');
-      if (!from || !to) return null;
-      if (!seenKeys.has(from) || !seenKeys.has(to) || from === to) return null;
-      const label =
-        typeof er.label === 'string' && er.label.trim().length > 0
-          ? truncate(er.label.trim(), 60)
-          : undefined;
-      return { from, to, label };
-    })
-    .filter((e): e is AIPlanEdge => e !== null);
+  const edges: AIPlanEdge[] = [];
+  rawEdges.forEach((e, index) => {
+    if (typeof e !== 'object' || e === null) {
+      if (trace) pushTraceIssue(trace.droppedEdges, `edges[${index}] ignored: not an object.`);
+      return;
+    }
+    const er = e as Record<string, unknown>;
+    const from = normalizeKey(typeof er.from === 'string' ? er.from : '');
+    const to = normalizeKey(typeof er.to === 'string' ? er.to : '');
+    if (!from || !to) {
+      if (trace) pushTraceIssue(trace.droppedEdges, `edges[${index}] ignored: missing from/to.`);
+      return;
+    }
+    if (!seenKeys.has(from) || !seenKeys.has(to)) {
+      if (trace) pushTraceIssue(trace.droppedEdges, `edges[${index}] ignored: references unknown key(s) '${from}' -> '${to}'.`);
+      return;
+    }
+    if (from === to) {
+      if (trace) pushTraceIssue(trace.droppedEdges, `edges[${index}] ignored: self-reference '${from}'.`);
+      return;
+    }
+    const label =
+      typeof er.label === 'string' && er.label.trim().length > 0
+        ? truncate(er.label.trim(), 60)
+        : undefined;
+    edges.push({ from, to, label });
+  });
 
   // ── Updates ────────────────────────────────────────────────────────────────
-  const rawUpdates = Array.isArray(obj.updates) ? obj.updates : [];
   const contextShapeById = new Map(contextShapes.map((shape) => [shape.id, shape]));
   const occupiedForUpdates: OccupiedBox[] = [
     ...occupiedContextBoxes,
@@ -797,82 +1042,187 @@ function sanitizeAndValidatePlan(
       };
     }),
   ];
-  const updates: AIPlanUpdate[] = rawUpdates
-    .slice(0, 20)
-    .map((u): AIPlanUpdate | null => {
-      if (typeof u !== 'object' || u === null) return null;
-      const ur = u as Record<string, unknown>;
-      const id = typeof ur.id === 'string' ? ur.id.trim() : '';
-      if (!id) return null;
-      const update: AIPlanUpdate = { id };
-      if (typeof ur.text === 'string') update.text = truncate(ur.text.trim(), MAX_NODE_TEXT);
-      if (typeof ur.x === 'number' && Number.isFinite(ur.x)) update.x = ur.x;
-      if (typeof ur.y === 'number' && Number.isFinite(ur.y)) update.y = ur.y;
+  const updates: AIPlanUpdate[] = [];
+  rawUpdates.slice(0, 20).forEach((u, index) => {
+    if (typeof u !== 'object' || u === null) {
+      if (trace) pushTraceIssue(trace.droppedUpdates, `updates[${index}] ignored: not an object.`);
+      return;
+    }
+    const ur = u as Record<string, unknown>;
+    const id = typeof ur.id === 'string' ? ur.id.trim() : '';
+    if (!id) {
+      if (trace) pushTraceIssue(trace.droppedUpdates, `updates[${index}] ignored: missing id.`);
+      return;
+    }
+    const update: AIPlanUpdate = { id };
+    if (typeof ur.text === 'string') update.text = truncate(ur.text.trim(), MAX_NODE_TEXT);
+    if (typeof ur.x === 'number' && Number.isFinite(ur.x)) update.x = ur.x;
+    if (typeof ur.y === 'number' && Number.isFinite(ur.y)) update.y = ur.y;
 
-      const hasPositionPatch = update.x !== undefined || update.y !== undefined;
-      if (hasPositionPatch) {
-        const target = contextShapeById.get(id);
-        if (target) {
-          const candidate: OccupiedBox = {
-            id,
-            x: update.x ?? target.centerX,
-            y: update.y ?? target.centerY,
-            hw: Math.max(1, target.width / 2),
-            hh: Math.max(1, target.height / 2),
-          };
-          const occupiedWithoutTarget = occupiedForUpdates.filter((box) => box.id !== id);
-          const resolved = findNonCollidingBoxPosition(candidate, occupiedWithoutTarget, viewport);
-          update.x = resolved.x;
-          update.y = resolved.y;
+    const hasPositionPatch = update.x !== undefined || update.y !== undefined;
+    if (hasPositionPatch) {
+      const target = contextShapeById.get(id);
+      if (target) {
+        const candidate: OccupiedBox = {
+          id,
+          x: update.x ?? target.centerX,
+          y: update.y ?? target.centerY,
+          hw: Math.max(1, target.width / 2),
+          hh: Math.max(1, target.height / 2),
+        };
+        const occupiedWithoutTarget = occupiedForUpdates.filter((box) => box.id !== id);
+        const resolved = findNonCollidingBoxPosition(candidate, occupiedWithoutTarget, viewport);
+        update.x = resolved.x;
+        update.y = resolved.y;
 
-          const existingIndex = occupiedForUpdates.findIndex((box) => box.id === id);
-          if (existingIndex >= 0) {
-            occupiedForUpdates[existingIndex] = { ...candidate, x: resolved.x, y: resolved.y };
-          } else {
-            occupiedForUpdates.push({ ...candidate, x: resolved.x, y: resolved.y });
-          }
+        const existingIndex = occupiedForUpdates.findIndex((box) => box.id === id);
+        if (existingIndex >= 0) {
+          occupiedForUpdates[existingIndex] = { ...candidate, x: resolved.x, y: resolved.y };
+        } else {
+          occupiedForUpdates.push({ ...candidate, x: resolved.x, y: resolved.y });
         }
       }
+    }
 
-      if (!update.text && update.x === undefined && update.y === undefined) return null;
-      return update;
-    })
-    .filter((u): u is AIPlanUpdate => u !== null);
+    if (!update.text && update.x === undefined && update.y === undefined) {
+      if (trace) pushTraceIssue(trace.droppedUpdates, `updates[${index}] ignored: must include text and/or x/y.`);
+      return;
+    }
+    updates.push(update);
+  });
+  if (trace && rawUpdates.length > 20) {
+    pushTraceIssue(trace.droppedUpdates, `${rawUpdates.length - 20} extra update(s) ignored due to cap of 20.`);
+  }
 
   // ── Deletes ────────────────────────────────────────────────────────────────
-  const rawDeletes = Array.isArray(obj.deletes) ? obj.deletes : [];
-  const deletes: AIPlanDelete[] = rawDeletes
-    .slice(0, 20)
-    .map((d): AIPlanDelete | null => {
-      if (typeof d !== 'object' || d === null) return null;
-      const dr = d as Record<string, unknown>;
-      const id = typeof dr.id === 'string' ? dr.id.trim() : '';
-      return id ? { id } : null;
-    })
-    .filter((d): d is AIPlanDelete => d !== null);
+  const deletes: AIPlanDelete[] = [];
+  rawDeletes.slice(0, 20).forEach((d, index) => {
+    if (typeof d !== 'object' || d === null) {
+      if (trace) pushTraceIssue(trace.droppedDeletes, `deletes[${index}] ignored: not an object.`);
+      return;
+    }
+    const dr = d as Record<string, unknown>;
+    const id = typeof dr.id === 'string' ? dr.id.trim() : '';
+    if (!id) {
+      if (trace) pushTraceIssue(trace.droppedDeletes, `deletes[${index}] ignored: missing id.`);
+      return;
+    }
+    deletes.push({ id });
+  });
+  if (trace && rawDeletes.length > 20) {
+    pushTraceIssue(trace.droppedDeletes, `${rawDeletes.length - 20} extra delete(s) ignored due to cap of 20.`);
+  }
 
   // ── Clusters ───────────────────────────────────────────────────────────────
-  const rawClusters = Array.isArray(obj.clusters) ? obj.clusters : [];
-  const clusters: AIPlanCluster[] = rawClusters
-    .slice(0, 20)
-    .map((c): AIPlanCluster | null => {
-      if (typeof c !== 'object' || c === null) return null;
-      const cr = c as Record<string, unknown>;
-      const shapeIds = Array.isArray(cr.shapeIds)
-        ? cr.shapeIds
-            .map((id) => (typeof id === 'string' ? id.trim() : ''))
-            .filter((id) => id.length > 0)
-        : [];
-      if (shapeIds.length < 2) return null;
-      const uniqueShapeIds = [...new Set(shapeIds)].slice(0, 20);
-      if (uniqueShapeIds.length < 2) return null;
-      const label =
-        typeof cr.label === 'string' && cr.label.trim().length > 0
-          ? truncate(cr.label.trim(), 80)
-          : undefined;
-      return { shapeIds: uniqueShapeIds, label };
-    })
-    .filter((c): c is AIPlanCluster => c !== null);
+  const clusters: AIPlanCluster[] = [];
+  rawClusters.slice(0, 20).forEach((c, index) => {
+    if (typeof c !== 'object' || c === null) {
+      if (trace) pushTraceIssue(trace.droppedClusters, `clusters[${index}] ignored: not an object.`);
+      return;
+    }
+    const cr = c as Record<string, unknown>;
+    const shapeIds = Array.isArray(cr.shapeIds)
+      ? cr.shapeIds
+          .map((id) => (typeof id === 'string' ? id.trim() : ''))
+          .filter((id) => id.length > 0)
+      : [];
+    if (shapeIds.length < 2) {
+      if (trace) pushTraceIssue(trace.droppedClusters, `clusters[${index}] ignored: requires at least 2 shapeIds.`);
+      return;
+    }
+    const uniqueShapeIds = [...new Set(shapeIds)].slice(0, 20);
+    if (uniqueShapeIds.length < 2) {
+      if (trace) pushTraceIssue(trace.droppedClusters, `clusters[${index}] ignored: not enough unique shapeIds.`);
+      return;
+    }
+    const label =
+      typeof cr.label === 'string' && cr.label.trim().length > 0
+        ? truncate(cr.label.trim(), 80)
+        : undefined;
+    clusters.push({ shapeIds: uniqueShapeIds, label });
+  });
+  if (trace && rawClusters.length > 20) {
+    pushTraceIssue(trace.droppedClusters, `${rawClusters.length - 20} extra cluster(s) ignored due to cap of 20.`);
+  }
+
+  // ── Media requests ────────────────────────────────────────────────────────
+  const media: AIPlanMediaRequest[] = [];
+  const seenMediaKeys = new Set<string>();
+  const maxMediaRequests = Math.min(MAX_MEDIA_HARD, maxNodes);
+  rawMedia.slice(0, maxMediaRequests).forEach((entry, index) => {
+    if (typeof entry !== 'object' || entry === null) {
+      if (trace) pushTraceIssue(trace.droppedMedia, `media[${index}] ignored: not an object.`);
+      return;
+    }
+
+    const mediaRecord = entry as Record<string, unknown>;
+    const key = normalizeKey(typeof mediaRecord.key === 'string' ? mediaRecord.key : '');
+    if (!key) {
+      if (trace) pushTraceIssue(trace.droppedMedia, `media[${index}] ignored: missing key.`);
+      return;
+    }
+    if (seenMediaKeys.has(key)) {
+      if (trace) pushTraceIssue(trace.droppedMedia, `media[${index}] ignored: duplicate key '${key}'.`);
+      return;
+    }
+
+    const mediaTypeRaw =
+      typeof mediaRecord.mediaType === 'string'
+        ? mediaRecord.mediaType
+        : typeof mediaRecord.type === 'string'
+          ? mediaRecord.type
+          : 'image';
+    const mediaType = mediaTypeRaw.trim().toLowerCase() === 'video' ? 'video' : 'image';
+
+    const prompt = typeof mediaRecord.prompt === 'string' ? truncate(mediaRecord.prompt.trim(), MAX_MESSAGE_TEXT) : '';
+    if (!prompt) {
+      if (trace) pushTraceIssue(trace.droppedMedia, `media[${index}] ignored: missing prompt.`);
+      return;
+    }
+
+    const rawX = typeof mediaRecord.x === 'number' ? mediaRecord.x : null;
+    const rawY = typeof mediaRecord.y === 'number' ? mediaRecord.y : null;
+    if (rawX === null || rawY === null || !Number.isFinite(rawX) || !Number.isFinite(rawY)) {
+      if (trace) pushTraceIssue(trace.droppedMedia, `media[${index}] ignored: x/y must be finite numbers.`);
+      return;
+    }
+
+    seenMediaKeys.add(key);
+    media.push({
+      key,
+      mediaType,
+      prompt,
+      x: clamp(rawX, minX, maxX),
+      y: clamp(rawY, minY, maxY),
+      aspectRatio:
+        typeof mediaRecord.aspectRatio === 'string' && mediaRecord.aspectRatio.trim().length > 0
+          ? truncate(mediaRecord.aspectRatio.trim(), 24)
+          : undefined,
+      resolution:
+        typeof mediaRecord.resolution === 'string' && mediaRecord.resolution.trim().length > 0
+          ? truncate(mediaRecord.resolution.trim(), 24)
+          : undefined,
+      modelId:
+        typeof mediaRecord.modelId === 'string' && mediaRecord.modelId.trim().length > 0
+          ? truncate(mediaRecord.modelId.trim(), 120)
+          : undefined,
+    });
+  });
+  if (trace && rawMedia.length > maxMediaRequests) {
+    pushTraceIssue(
+      trace.droppedMedia,
+      `${rawMedia.length - maxMediaRequests} extra media request(s) ignored due to cap of ${maxMediaRequests}.`,
+    );
+  }
+
+  if (trace) {
+    trace.acceptedCounts.nodes = placedNodes.length;
+    trace.acceptedCounts.edges = edges.length;
+    trace.acceptedCounts.updates = updates.length;
+    trace.acceptedCounts.deletes = deletes.length;
+    trace.acceptedCounts.clusters = clusters.length;
+    trace.acceptedCounts.media = media.length;
+  }
 
   // ── Mode detection ─────────────────────────────────────────────────────────
   const hasCanvasOps =
@@ -880,10 +1230,23 @@ function sanitizeAndValidatePlan(
     edges.length > 0 ||
     updates.length > 0 ||
     deletes.length > 0 ||
-    clusters.length > 0;
+    clusters.length > 0 ||
+    media.length > 0;
   const isConversational = message !== undefined && !hasCanvasOps;
 
-  if (!isConversational && !hasCanvasOps) return null;
+  if (!isConversational && !hasCanvasOps) {
+    if (trace) {
+      trace.outcome = 'invalid';
+      trace.invalidReason = message
+        ? 'Message was provided together with empty canvas operations.'
+        : 'No message and no valid canvas operations remained after sanitization.';
+    }
+    return null;
+  }
+
+  if (trace) {
+    trace.outcome = isConversational ? 'conversational' : 'canvas';
+  }
 
   return {
     message: isConversational ? message : undefined,
@@ -892,6 +1255,7 @@ function sanitizeAndValidatePlan(
     updates: updates.length > 0 ? updates : undefined,
     deletes: deletes.length > 0 ? deletes : undefined,
     clusters: clusters.length > 0 ? clusters : undefined,
+    media: media.length > 0 ? media : undefined,
   };
 }
 
@@ -917,6 +1281,27 @@ function buildFallbackPlan(
   };
 }
 
+function summarizePlan(plan: AIPlan): Record<string, unknown> {
+  return {
+    nodeCount: plan.nodes.length,
+    edgeCount: plan.edges.length,
+    updateCount: plan.updates?.length ?? 0,
+    deleteCount: plan.deletes?.length ?? 0,
+    clusterCount: plan.clusters?.length ?? 0,
+    mediaCount: plan.media?.length ?? 0,
+    conversational: Boolean(plan.message && plan.nodes.length === 0),
+    hasMessage: typeof plan.message === 'string' && plan.message.length > 0,
+  };
+}
+
+function summarizeToolCalls(toolCalls: ToolCall[]): Record<string, number> {
+  return toolCalls.reduce<Record<string, number>>((acc, toolCall) => {
+    const key = String(toolCall.toolName);
+    acc[key] = (acc[key] ?? 0) + 1;
+    return acc;
+  }, {});
+}
+
 // ---------------------------------------------------------------------------
 // Planner AI call
 // ---------------------------------------------------------------------------
@@ -932,6 +1317,12 @@ async function callPlannerAI(
 ): Promise<PlannerResult> {
   const apiKey = getConfiguredApiKey();
   if (!apiKey) {
+    logPlanner('warn', 'planner.api_key.missing', {
+      turnId: request.turnId,
+      roomId: request.roomId,
+      sessionId: request.sessionId,
+      prompt: request.prompt,
+    });
     return {
       plan: buildFallbackPlan(request.prompt, request.context.viewport),
       fallbackFailure: {
@@ -945,38 +1336,99 @@ async function callPlannerAI(
   const contextShapes = getContextShapeLayouts(request);
   const contextSummary = buildCanvasContextSummary(request, contextShapes);
   const userContent = `Canvas context:\n${contextSummary}\n\nUser request: ${request.prompt}`;
+  const model = getConfiguredModel();
+  const timeoutMs = getConfiguredTimeoutMs();
+  const maxOutputTokens = getConfiguredMaxOutputTokens();
+  const systemPrompt = buildSystemPrompt(request.context.viewport);
+  const requestUrl = `${geminiApiBaseUrl}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const requestBody = {
+    generationConfig: {
+      temperature: 0.3,
+      maxOutputTokens,
+    },
+    systemInstruction: {
+      parts: [{ text: systemPrompt }],
+    },
+    contents: [{ role: 'user', parts: [{ text: userContent }] }],
+  };
+
+  logPlanner('info', 'planner.request', {
+    turnId: request.turnId,
+    roomId: request.roomId,
+    sessionId: request.sessionId,
+    model,
+    timeoutMs,
+    maxNodes,
+    maxOutputTokens,
+    viewport: request.context.viewport,
+    contextShapeCount: contextShapes.length,
+    contextSummary,
+    userPrompt: request.prompt,
+    systemPrompt,
+    userContent,
+    requestUrl: requestUrl.replace(/key=[^&]+/, 'key=[REDACTED]'),
+    requestBody,
+  });
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), getConfiguredTimeoutMs());
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(
-      `${geminiApiBaseUrl}/models/${encodeURIComponent(getConfiguredModel())}:generateContent?key=${encodeURIComponent(apiKey)}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          generationConfig: {
-            temperature: 0.3,
-            maxOutputTokens: getConfiguredMaxOutputTokens(),
-          },
-          systemInstruction: {
-            parts: [{ text: buildSystemPrompt(request.context.viewport) }],
-          },
-          contents: [{ role: 'user', parts: [{ text: userContent }] }],
-        }),
-        signal: controller.signal,
-      },
-    );
+    const response = await fetch(requestUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+      signal: controller.signal,
+    });
+
+    const rawResponseText = await response.text();
+    logPlanner('info', 'planner.response.raw', {
+      turnId: request.turnId,
+      status: response.status,
+      ok: response.ok,
+      statusText: response.statusText,
+      rawResponseText,
+    });
+
+    let body: {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      error?: { code?: number; message?: string };
+    };
+    try {
+      body = rawResponseText.trim().length > 0
+        ? (JSON.parse(rawResponseText) as {
+            candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+            error?: { code?: number; message?: string };
+          })
+        : {};
+    } catch (error) {
+      logPlanner('warn', 'planner.response.invalid_json', {
+        turnId: request.turnId,
+        status: response.status,
+        parseError: serializeError(error),
+        rawResponseText,
+      });
+      return {
+        plan: buildFallbackPlan(request.prompt, request.context.viewport),
+        fallbackFailure: {
+          code: 'provider_error',
+          message: 'Gemini response was not valid JSON. Showing fallback.',
+          retryable: true,
+        },
+      };
+    }
 
     if (!response.ok) {
       let msg = `Gemini HTTP ${response.status}`;
-      try {
-        const err = (await response.json()) as { error?: { message?: string } };
-        if (typeof err.error?.message === 'string') {
-          msg = `Gemini error (${response.status}): ${err.error.message}`;
-        }
-      } catch { /* ignore */ }
+      if (typeof body.error?.message === 'string') {
+        msg = `Gemini error (${response.status}): ${body.error.message}`;
+      }
+      logPlanner('warn', 'planner.response.http_error', {
+        turnId: request.turnId,
+        status: response.status,
+        message: msg,
+        body,
+      });
       return {
         plan: buildFallbackPlan(request.prompt, request.context.viewport),
         fallbackFailure: {
@@ -987,12 +1439,12 @@ async function callPlannerAI(
       };
     }
 
-    const body = (await response.json()) as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-      error?: { code?: number; message?: string };
-    };
-
     if (body.error) {
+      logPlanner('warn', 'planner.response.provider_error', {
+        turnId: request.turnId,
+        providerError: body.error,
+        body,
+      });
       return {
         plan: buildFallbackPlan(request.prompt, request.context.viewport),
         fallbackFailure: {
@@ -1008,10 +1460,24 @@ async function callPlannerAI(
       .join('')
       .trim();
 
+    const strippedText = stripMarkdownFences(rawText);
+    logPlanner('info', 'planner.response.model_text', {
+      turnId: request.turnId,
+      rawText,
+      strippedText,
+      candidateCount: body.candidates?.length ?? 0,
+    });
+
     let parsed: unknown;
     try {
-      parsed = JSON.parse(stripMarkdownFences(rawText));
-    } catch {
+      parsed = JSON.parse(strippedText);
+    } catch (error) {
+      logPlanner('warn', 'planner.response.model_text_invalid_json', {
+        turnId: request.turnId,
+        parseError: serializeError(error),
+        rawText,
+        strippedText,
+      });
       return {
         plan: buildFallbackPlan(request.prompt, request.context.viewport),
         fallbackFailure: {
@@ -1022,7 +1488,16 @@ async function callPlannerAI(
       };
     }
 
-    const plan = sanitizeAndValidatePlan(parsed, request.context.viewport, maxNodes, contextShapes);
+    const validationTrace = createPlanValidationTrace(parsed);
+    const plan = sanitizeAndValidatePlan(parsed, request.context.viewport, maxNodes, contextShapes, validationTrace);
+
+    logPlanner(plan ? 'info' : 'warn', 'planner.response.sanitized_plan', {
+      turnId: request.turnId,
+      parsedPlan: parsed,
+      validationTrace,
+      sanitizedPlan: plan,
+    });
+
     if (!plan) {
       return {
         plan: buildFallbackPlan(request.prompt, request.context.viewport),
@@ -1036,8 +1511,14 @@ async function callPlannerAI(
 
     return { plan };
   } catch (error) {
-    const timeoutMs = getConfiguredTimeoutMs();
     const isTimeoutAbort = error instanceof Error && error.name === 'AbortError';
+    logPlanner('error', 'planner.request.failed', {
+      turnId: request.turnId,
+      isTimeoutAbort,
+      timeoutMs,
+      error: serializeError(error),
+    });
+
     const msg = error instanceof Error ? error.message : 'Unknown error';
     return {
       plan: buildFallbackPlan(request.prompt, request.context.viewport),
@@ -1165,6 +1646,23 @@ function compilePlanToToolCalls(
     })
     .filter((op): op is ToolCall => op !== null);
 
+  // ── Media ops ──────────────────────────────────────────────────────────────
+  const mediaOps: ToolCall[] = (plan.media ?? []).map((item): ToolCall => {
+    const mediaShapeId = `shape-${turnId}-media-${normalizeKey(item.key)}`;
+    return {
+      toolName: (item.mediaType === 'video' ? 'generate_video' : 'generate_image') as ToolName,
+      arguments: {
+        id: mediaShapeId,
+        prompt: item.prompt,
+        x: item.x,
+        y: item.y,
+        ...(item.aspectRatio !== undefined && { aspectRatio: item.aspectRatio }),
+        ...(item.resolution !== undefined && { resolution: item.resolution }),
+        ...(item.modelId !== undefined && { modelId: item.modelId }),
+      },
+    };
+  });
+
   // ── Update ops ─────────────────────────────────────────────────────────────
   const updateOps: ToolCall[] = (plan.updates ?? []).map((u): ToolCall => ({
     toolName: 'update_shape' as ToolName,
@@ -1182,17 +1680,17 @@ function compilePlanToToolCalls(
     arguments: { id: d.id },
   }));
 
-  const allOps = [...createOps, ...arrowOps, ...clusterOps, ...updateOps, ...deleteOps];
+  const allOps = [...createOps, ...arrowOps, ...clusterOps, ...mediaOps, ...updateOps, ...deleteOps];
 
   if (allOps.length <= maxTools) {
     return { toolCalls: allOps, truncated: false };
   }
 
   // ── Budget exceeded: truncate gracefully ───────────────────────────────────
-  // Priority: updates > deletes > stickies/geo/text > arrows > warning note
+  // Priority: updates > deletes > shapes/media > arrows > warning note
   const budgetForContent = maxTools - 1; // reserve 1 for the truncation note
 
-  const prioritized = [...updateOps, ...deleteOps, ...createOps];
+  const prioritized = [...updateOps, ...deleteOps, ...createOps, ...mediaOps];
   const kept = prioritized.slice(0, budgetForContent);
 
   const keptCreateIds = new Set(
@@ -1205,6 +1703,8 @@ function compilePlanToToolCalls(
     const args = op.arguments as { fromShapeId: string; toShapeId: string };
     return keptCreateIds.has(args.fromShapeId) && keptCreateIds.has(args.toShapeId);
   });
+
+  const keptMediaOps = kept.filter((op) => op.toolName === 'generate_image' || op.toolName === 'generate_video');
 
   const keptClusters = clusterOps.filter((op) => {
     const args = op.arguments as { shapeIds: string[] };
@@ -1250,7 +1750,7 @@ function compilePlanToToolCalls(
       id: `shape-${turnId}-truncated`,
       x: clamp(noteCandidateX, minX, maxX),
       y: clamp(noteCandidateY, minY, maxY),
-      text: `⚠️ Truncated: showing ${kept.filter(o => ['place_sticky','place_geo','place_text'].includes(o.toolName as string)).length} of ${plan.nodes.length} shapes.`,
+      text: `⚠️ Truncated: kept ${kept.length + finalArrows.length + finalClusters.length} of ${allOps.length} operations (${keptMediaOps.length} media).`,
     },
   };
 
@@ -1270,13 +1770,35 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
     },
   ];
 
+  logPlanner('info', 'turn.started', {
+    turnId: request.turnId,
+    roomId: request.roomId,
+    sessionId: request.sessionId,
+    prompt: request.prompt,
+    viewport: request.context.viewport,
+    contextMaxShapes: request.context.maxShapes,
+  });
+
   const maxToolsPerTurn = getConfiguredMaxToolsPerTurn();
   const maxNodes = Math.min(MAX_NODES_HARD, Math.max(1, maxToolsPerTurn - 1));
 
   // --- 1. Get plan from AI ---
   const { plan, fallbackFailure } = await callPlannerAI(request, maxNodes);
 
+  logPlanner('info', 'turn.plan.received', {
+    turnId: request.turnId,
+    maxToolsPerTurn,
+    maxNodes,
+    planSummary: summarizePlan(plan),
+    plan,
+    fallbackFailure,
+  });
+
   if (fallbackFailure) {
+    logPlanner('warn', 'turn.plan.fallback', {
+      turnId: request.turnId,
+      fallbackFailure,
+    });
     events.push({
       type: 'agent.stream.delta',
       turnId: request.turnId,
@@ -1286,7 +1808,20 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
   }
 
   // --- 2. Conversational mode ---
-  if (plan.message && plan.nodes.length === 0) {
+  if (
+    plan.message &&
+    plan.nodes.length === 0 &&
+    plan.edges.length === 0 &&
+    (plan.updates?.length ?? 0) === 0 &&
+    (plan.deletes?.length ?? 0) === 0 &&
+    (plan.clusters?.length ?? 0) === 0 &&
+    (plan.media?.length ?? 0) === 0
+  ) {
+    logPlanner('info', 'turn.conversational', {
+      turnId: request.turnId,
+      messageLength: plan.message.length,
+      message: plan.message,
+    });
     const chunkSize = 40;
     for (let i = 0; i < plan.message.length; i += chunkSize) {
       events.push({
@@ -1300,6 +1835,13 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
       type: 'agent.stream.completed',
       turnId: request.turnId,
       at: new Date().toISOString(),
+    });
+    logPlanner('info', 'turn.completed', {
+      turnId: request.turnId,
+      status: 'completed',
+      actionCount: 0,
+      eventCount: events.length,
+      mode: 'conversational',
     });
     return {
       turnId: request.turnId,
@@ -1318,6 +1860,22 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
     request.context.viewport,
   );
 
+  logPlanner('info', 'turn.tool_calls.compiled', {
+    turnId: request.turnId,
+    truncated,
+    toolCallCount: toolCalls.length,
+    toolCallSummary: summarizeToolCalls(toolCalls),
+    toolCalls,
+  });
+
+  if (toolCalls.length === 0) {
+    logPlanner('warn', 'turn.tool_calls.empty', {
+      turnId: request.turnId,
+      plan,
+      truncated,
+    });
+  }
+
   if (truncated) {
     events.push({
       type: 'agent.stream.delta',
@@ -1331,6 +1889,12 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
   const actions: CanvasActionEnvelope[] = [];
 
   for (const entry of toolCalls) {
+    logPlanner('info', 'turn.tool_call.begin', {
+      turnId: request.turnId,
+      toolName: entry.toolName,
+      arguments: entry.arguments,
+    });
+
     const completedToolEnvelope = createToolEnvelope(request.turnId, entry.toolName, entry.arguments);
     const serializedArguments = JSON.stringify(entry.arguments);
     const chunkSize = Math.max(8, Math.floor(serializedArguments.length / 2));
@@ -1359,6 +1923,12 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
       if (typeof p !== 'object' || p === null) throw new Error('Tool arguments were not an object.');
       parsedArguments = p as Record<string, unknown>;
     } catch (error) {
+      logPlanner('error', 'turn.tool_call.parse_failed', {
+        turnId: request.turnId,
+        toolName: entry.toolName,
+        argumentBuffer,
+        error: serializeError(error),
+      });
       const failure: FailureEnvelope = {
         code: 'malformed_tool_call',
         message: error instanceof Error ? error.message : 'Failed to parse tool arguments.',
@@ -1378,8 +1948,16 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
     });
 
     try {
-      const action = executeToolCall(request.roomId, validatedEnvelope);
+      const action = await executeToolCall(request.roomId, validatedEnvelope);
       actions.push(action);
+
+      logPlanner('info', 'turn.tool_call.executed', {
+        turnId: request.turnId,
+        toolName: entry.toolName,
+        arguments: parsedArguments,
+        action,
+      });
+
       events.push({
         type: 'agent.stream.action',
         turnId: request.turnId,
@@ -1387,6 +1965,12 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
         action,
       });
     } catch (error) {
+      logPlanner('error', 'turn.tool_call.execution_failed', {
+        turnId: request.turnId,
+        toolName: entry.toolName,
+        arguments: parsedArguments,
+        error: serializeError(error),
+      });
       const failure: FailureEnvelope = {
         code: 'tool_validation_failed',
         message: error instanceof Error ? error.message : 'Tool execution failed.',
@@ -1410,6 +1994,15 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
     type: 'agent.stream.completed',
     turnId: request.turnId,
     at: new Date().toISOString(),
+  });
+
+  logPlanner('info', 'turn.completed', {
+    turnId: request.turnId,
+    status: fallbackFailure ? 'fallback' : 'completed',
+    actionCount: actions.length,
+    actions,
+    eventCount: events.length,
+    fallbackFailure,
   });
 
   return {

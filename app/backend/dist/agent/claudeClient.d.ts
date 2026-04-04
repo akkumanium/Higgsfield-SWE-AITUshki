@@ -34,6 +34,17 @@ export interface AIPlanCluster {
     shapeIds: string[];
     label?: string;
 }
+export type AIMediaType = 'image' | 'video';
+export interface AIPlanMediaRequest {
+    key: string;
+    mediaType: AIMediaType;
+    prompt: string;
+    x: number;
+    y: number;
+    aspectRatio?: string;
+    resolution?: string;
+    modelId?: string;
+}
 export interface AIPlan {
     message?: string;
     nodes: AIPlanNode[];
@@ -41,6 +52,7 @@ export interface AIPlan {
     updates?: AIPlanUpdate[];
     deletes?: AIPlanDelete[];
     clusters?: AIPlanCluster[];
+    media?: AIPlanMediaRequest[];
 }
 export declare function streamGeminiTurn(request: AgentTurnRequest): Promise<AgentTurnResponse>;
 //# sourceMappingURL=claudeClient.d.ts.map

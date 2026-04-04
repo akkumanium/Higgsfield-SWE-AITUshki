@@ -116,7 +116,7 @@ export interface AgentContextResponse extends AgentContextRequest {
     compressedShapeCount: number;
     totalShapeCount: number;
 }
-export type ToolName = 'place_sticky' | 'place_geo' | 'place_text' | 'draw_arrow' | 'update_shape' | 'delete_shape' | 'cluster_shapes' | 'summarize_region' | 'generate_image';
+export type ToolName = 'place_sticky' | 'place_geo' | 'place_text' | 'draw_arrow' | 'update_shape' | 'delete_shape' | 'cluster_shapes' | 'summarize_region' | 'generate_image' | 'generate_video';
 export interface ToolCallEnvelope {
     id: CanvasActionId;
     turnId: AgentTurnId;

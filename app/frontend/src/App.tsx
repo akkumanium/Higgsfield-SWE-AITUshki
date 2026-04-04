@@ -32,6 +32,25 @@ const DEFAULT_NOTE_W = 200;
 const DEFAULT_NOTE_H = 120;
 const DEFAULT_GEO_W = 160;
 const DEFAULT_GEO_H = 80;
+const MEDIA_POLL_INTERVAL_MS = 3_500;
+const MEDIA_POLL_MAX_RETRIES = 120;
+
+type MediaStatus = 'queued' | 'in_progress' | 'completed' | 'failed' | 'nsfw';
+
+interface MediaRequestPayload {
+  requestId: string;
+  shapeId: string;
+  mediaType: 'image' | 'video';
+  status?: string;
+}
+
+interface MediaStatusResponse {
+  requestId: string;
+  status: MediaStatus;
+  imageUrl?: string;
+  videoUrl?: string;
+  error?: string;
+}
 
 export interface AppOptions {
   roomId?: string;
@@ -279,6 +298,13 @@ function getEditorShapesPageBounds(editor: Editor, shapeIds: string[]): PageBoun
   return bounds ?? undefined;
 }
 
+function createEditorAssets(editor: Editor, assets: unknown[]) {
+  const maybe = editor as unknown as {
+    createAssets?: (records: unknown[]) => void;
+  };
+  maybe.createAssets?.(assets);
+}
+
 function updateEditorShapes(editor: Editor, updates: Array<Record<string, unknown>>) {
   const maybe = editor as unknown as {
     updateShapes?: (partials: unknown[]) => void;
@@ -298,6 +324,109 @@ function groupEditorShapes(editor: Editor, shapeIds: string[], options?: { group
     groupShapes?: (ids: string[], opts?: { groupId?: string; select?: boolean }) => void;
   };
   maybe.groupShapes?.(shapeIds, options);
+}
+
+function normalizeMediaStatus(value: unknown): MediaStatus {
+  if (typeof value !== 'string') {
+    return 'failed';
+  }
+  const normalized = value.trim().toLowerCase();
+  if (
+    normalized === 'queued' ||
+    normalized === 'in_progress' ||
+    normalized === 'completed' ||
+    normalized === 'failed' ||
+    normalized === 'nsfw'
+  ) {
+    return normalized;
+  }
+  return 'failed';
+}
+
+function isTerminalMediaStatus(status: MediaStatus): boolean {
+  return status === 'completed' || status === 'failed' || status === 'nsfw';
+}
+
+function parseMediaRequestPayload(payload: unknown): MediaRequestPayload | null {
+  if (typeof payload !== 'object' || payload === null) {
+    return null;
+  }
+
+  const record = payload as Record<string, unknown>;
+  const requestId = typeof record.requestId === 'string' ? record.requestId.trim() : '';
+  const shapeId = typeof record.shapeId === 'string' ? record.shapeId.trim() : '';
+  const mediaType = record.mediaType === 'video' ? 'video' : record.mediaType === 'image' ? 'image' : null;
+
+  if (!requestId || !shapeId || !mediaType) {
+    return null;
+  }
+
+  return {
+    requestId,
+    shapeId,
+    mediaType,
+    status: typeof record.status === 'string' ? record.status : undefined,
+  };
+}
+
+function tryReplaceNoteWithImageShape(editor: Editor, shapeId: string, requestId: string, imageUrl: string): boolean {
+  const sourceShape = getEditorShape(editor, shapeId);
+  if (!sourceShape) {
+    return false;
+  }
+
+  const bounds = getEditorShapePageBounds(editor, shapeId);
+  const width = Math.max(120, Math.round(bounds?.w ?? 640));
+  const height = Math.max(80, Math.round(bounds?.h ?? 360));
+  const x = bounds?.x ?? (typeof sourceShape.x === 'number' ? sourceShape.x : 0);
+  const y = bounds?.y ?? (typeof sourceShape.y === 'number' ? sourceShape.y : 0);
+  const assetId = `asset:media-${requestId}-${Math.random().toString(36).slice(2, 8)}`;
+  const imageShapeId = toShapeId(`media-image-${requestId}`, 'media-image');
+
+  try {
+    createEditorAssets(editor, [
+      {
+        id: assetId,
+        typeName: 'asset',
+        type: 'image',
+        props: {
+          name: `higgsfield-${requestId}.jpg`,
+          src: imageUrl,
+          w: width,
+          h: height,
+          mimeType: 'image/jpeg',
+          isAnimated: false,
+        },
+        meta: {
+          requestId,
+          provider: 'higgsfield',
+        },
+      },
+    ]);
+
+    editor.createShapes([
+      {
+        id: imageShapeId,
+        type: 'image',
+        x,
+        y,
+        props: {
+          assetId,
+          w: width,
+          h: height,
+        },
+        meta: {
+          requestId,
+          provider: 'higgsfield',
+          source: 'agent-media',
+        },
+      } as never,
+    ]);
+    editor.deleteShapes([shapeId]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function toShapeSnapshot(editor: Editor, shape: TLShape): CanvasShapeSnapshot {
@@ -605,6 +734,10 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
   let isAgentRequestInFlight = false;
   let inFlightController: AbortController | null = null;
   const appliedRemoteActionIds = new Set<string>();
+  let isDisposed = false;
+  const mediaPollTimers = new Map<string, number>();
+  const mediaPollAttempts = new Map<string, number>();
+  const mediaShapeByRequestId = new Map<string, string>();
 
   const setAgentUiState = (busy: boolean, status: string, error = '') => {
     isAgentRequestInFlight = busy;
@@ -626,6 +759,235 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
     }
     chatOutput.textContent = `${chatOutput.textContent ?? ''}${delta}`;
     chatOutput.scrollTop = chatOutput.scrollHeight;
+  };
+
+  const clearMediaPoll = (requestId: string, clearShapeMapping = false) => {
+    const timerId = mediaPollTimers.get(requestId);
+    if (typeof timerId === 'number') {
+      window.clearTimeout(timerId);
+    }
+    mediaPollTimers.delete(requestId);
+    mediaPollAttempts.delete(requestId);
+    if (clearShapeMapping) {
+      mediaShapeByRequestId.delete(requestId);
+    }
+  };
+
+  const clearAllMediaPolls = () => {
+    for (const timerId of mediaPollTimers.values()) {
+      window.clearTimeout(timerId);
+    }
+    mediaPollTimers.clear();
+    mediaPollAttempts.clear();
+    mediaShapeByRequestId.clear();
+  };
+
+  const queueNextMediaPoll = (requestId: string, delayMs = MEDIA_POLL_INTERVAL_MS) => {
+    if (isDisposed) {
+      return;
+    }
+    const previousTimer = mediaPollTimers.get(requestId);
+    if (typeof previousTimer === 'number') {
+      window.clearTimeout(previousTimer);
+    }
+    const timer = window.setTimeout(() => {
+      void pollMediaRequest(requestId);
+    }, delayMs);
+    mediaPollTimers.set(requestId, timer);
+  };
+
+  const updateShapeMediaMeta = (
+    activeEditor: Editor,
+    shapeId: string,
+    patch: Record<string, unknown>,
+  ) => {
+    const maybeStore = activeEditor.store as unknown as {
+      get?: (id: string) => unknown;
+    };
+    const existing = maybeStore.get?.(shapeId);
+    if (!isShapeRecord(existing)) {
+      return;
+    }
+
+    const typed = existing as TLShape & { meta?: Record<string, unknown> };
+    const existingAgentMedia =
+      typeof typed.meta?.agentMedia === 'object' && typed.meta.agentMedia !== null
+        ? (typed.meta.agentMedia as Record<string, unknown>)
+        : {};
+
+    activeEditor.store.put([
+      {
+        ...typed,
+        meta: {
+          ...(typed.meta ?? {}),
+          agentMedia: {
+            ...existingAgentMedia,
+            ...patch,
+          },
+        },
+      },
+    ]);
+  };
+
+  const applyMediaStatusToShape = (statusPayload: MediaStatusResponse) => {
+    const activeEditor = editor;
+    if (!activeEditor) {
+      return;
+    }
+
+    const shapeId = mediaShapeByRequestId.get(statusPayload.requestId);
+    if (!shapeId) {
+      return;
+    }
+
+    const existing = getEditorShape(activeEditor, shapeId);
+    if (!existing) {
+      clearMediaPoll(statusPayload.requestId, true);
+      return;
+    }
+
+    const typed = existing as TLShape & { meta?: Record<string, unknown> };
+    const agentMediaMeta =
+      typeof typed.meta?.agentMedia === 'object' && typed.meta.agentMedia !== null
+        ? (typed.meta.agentMedia as Record<string, unknown>)
+        : {};
+    const mediaType = agentMediaMeta.mediaType === 'video' ? 'video' : 'image';
+
+    if (statusPayload.status === 'completed' && mediaType === 'image' && statusPayload.imageUrl) {
+      const replaced = tryReplaceNoteWithImageShape(activeEditor, shapeId, statusPayload.requestId, statusPayload.imageUrl);
+      if (replaced) {
+        clearMediaPoll(statusPayload.requestId, true);
+        return;
+      }
+    }
+
+    const mediaUrl = mediaType === 'video' ? statusPayload.videoUrl : statusPayload.imageUrl;
+    const statusText =
+      statusPayload.status === 'completed'
+        ? 'completed'
+        : statusPayload.status === 'failed'
+          ? 'failed'
+          : statusPayload.status === 'nsfw'
+            ? 'blocked (nsfw)'
+            : 'in progress';
+    const cardTitle = mediaType === 'video' ? 'Video job' : 'Image job';
+    const message = `${cardTitle} ${statusText}\n${mediaUrl ? `URL: ${mediaUrl}` : ''}${statusPayload.error ? `\nError: ${statusPayload.error}` : ''}`.trim();
+
+    updateEditorShapes(activeEditor, [
+      {
+        id: existing.id,
+        type: existing.type,
+        props:
+          existing.type === 'arrow'
+            ? { text: message }
+            : {
+                richText: toRichText(message),
+              },
+      },
+    ]);
+
+    updateShapeMediaMeta(activeEditor, shapeId, {
+      status: statusPayload.status,
+      imageUrl: statusPayload.imageUrl,
+      videoUrl: statusPayload.videoUrl,
+      errorMessage: statusPayload.error,
+      completedAt: statusPayload.status === 'completed' ? new Date().toISOString() : undefined,
+    });
+
+    if (isTerminalMediaStatus(statusPayload.status)) {
+      clearMediaPoll(statusPayload.requestId, true);
+    }
+  };
+
+  const pollMediaRequest = async (requestId: string) => {
+    if (isDisposed) {
+      return;
+    }
+
+    mediaPollTimers.delete(requestId);
+    if (!mediaShapeByRequestId.has(requestId)) {
+      clearMediaPoll(requestId, true);
+      return;
+    }
+
+    try {
+      const response = await fetch(`${backendUrl}/media/requests/${encodeURIComponent(requestId)}/status`, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+      const body = (await response.json()) as Record<string, unknown>;
+
+      const statusPayload: MediaStatusResponse = {
+        requestId,
+        status: normalizeMediaStatus(body.status),
+        imageUrl: typeof body.imageUrl === 'string' ? body.imageUrl : undefined,
+        videoUrl: typeof body.videoUrl === 'string' ? body.videoUrl : undefined,
+        error: typeof body.error === 'string' ? body.error : undefined,
+      };
+
+      applyMediaStatusToShape(statusPayload);
+      if (!isTerminalMediaStatus(statusPayload.status)) {
+        queueNextMediaPoll(requestId);
+      }
+    } catch {
+      const attempts = (mediaPollAttempts.get(requestId) ?? 0) + 1;
+      mediaPollAttempts.set(requestId, attempts);
+      if (attempts >= MEDIA_POLL_MAX_RETRIES) {
+        applyMediaStatusToShape({
+          requestId,
+          status: 'failed',
+          error: 'Polling timed out while waiting for media generation.',
+        });
+        clearMediaPoll(requestId, true);
+        return;
+      }
+      queueNextMediaPoll(requestId);
+    }
+  };
+
+  const registerMediaRequest = (mediaRequest: MediaRequestPayload | null) => {
+    if (!mediaRequest) {
+      return;
+    }
+
+    mediaShapeByRequestId.set(mediaRequest.requestId, mediaRequest.shapeId);
+    const normalizedStatus = normalizeMediaStatus(mediaRequest.status);
+    if (isTerminalMediaStatus(normalizedStatus)) {
+      void pollMediaRequest(mediaRequest.requestId);
+      return;
+    }
+
+    if (!mediaPollTimers.has(mediaRequest.requestId)) {
+      queueNextMediaPoll(mediaRequest.requestId, 900);
+    }
+  };
+
+  const registerMediaRequestsFromSnapshot = (activeEditor: Editor) => {
+    const shapes = collectShapesFromSnapshot(getCurrentShapeSnapshot(activeEditor));
+    for (const shape of shapes) {
+      const typed = shape as TLShape & { meta?: Record<string, unknown> };
+      const agentMedia =
+        typeof typed.meta?.agentMedia === 'object' && typed.meta.agentMedia !== null
+          ? (typed.meta.agentMedia as Record<string, unknown>)
+          : null;
+      if (!agentMedia) {
+        continue;
+      }
+
+      const requestId = typeof agentMedia.requestId === 'string' ? agentMedia.requestId.trim() : '';
+      if (!requestId) {
+        continue;
+      }
+
+      registerMediaRequest({
+        requestId,
+        shapeId: shape.id,
+        mediaType: agentMedia.mediaType === 'video' ? 'video' : 'image',
+        status: typeof agentMedia.status === 'string' ? agentMedia.status : undefined,
+      });
+    }
   };
 
   setAgentUiState(false, 'Ready', '');
@@ -747,6 +1109,7 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
     }
 
     applyingRemoteAction = true;
+    const mediaRequestsToRegister: MediaRequestPayload[] = [];
     try {
       activeEditor.run(() => {
         for (const operation of plan.operations) {
@@ -754,6 +1117,11 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
             const shapeInput = operation.payload.shapeInput;
             if (shapeInput && typeof shapeInput === 'object') {
               activeEditor.createShapes([shapeInput as never]);
+
+              const mediaRequest = parseMediaRequestPayload(operation.payload.mediaRequest);
+              if (mediaRequest) {
+                mediaRequestsToRegister.push(mediaRequest);
+              }
 
               const center =
                 typeof operation.payload.center === 'object' && operation.payload.center !== null
@@ -855,9 +1223,14 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
                 };
 
                 if (textPatch !== undefined) {
-                  patch.props = {
-                    richText: toRichText(textPatch),
-                  };
+                  patch.props =
+                    existing.type === 'arrow'
+                      ? {
+                          text: textPatch,
+                        }
+                      : {
+                          richText: toRichText(textPatch),
+                        };
                 }
 
                 if (xPatch !== undefined || yPatch !== undefined) {
@@ -964,6 +1337,10 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
           }
         }
       });
+
+      for (const mediaRequest of mediaRequestsToRegister) {
+        registerMediaRequest(mediaRequest);
+      }
     } finally {
       applyingRemoteAction = false;
     }
@@ -1120,6 +1497,7 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
         editor = mountedEditor;
         const snapshot = getCurrentShapeSnapshot(mountedEditor);
         void collectShapesFromSnapshot(snapshot);
+        registerMediaRequestsFromSnapshot(mountedEditor);
         mountedEditor.store.listen(onStoreChange, {
           scope: 'document',
           source: 'user',
@@ -1133,6 +1511,8 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
   return {
     root,
     dispose() {
+      isDisposed = true;
+      clearAllMediaPolls();
       triggerButton.removeEventListener('click', triggerFromPanel);
       cancelButton.removeEventListener('click', onCancelRequest);
       input.removeEventListener('keydown', onInputKeydown);

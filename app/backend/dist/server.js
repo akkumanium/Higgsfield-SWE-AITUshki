@@ -1,4 +1,5 @@
 import { streamGeminiTurn } from './agent/claudeClient.js';
+import { getHiggsfieldGenerationStatus } from './agent/higgsfieldClient.js';
 const defaultMinTurnIntervalMs = 5_000;
 const defaultMaxActionsPerTurn = 50;
 const lastTurnBySession = new Map();
@@ -71,6 +72,22 @@ function writeSseEvent(response, event, data) {
     response.write(`event: ${event}\n`);
     response.write(`data: ${JSON.stringify(data)}\n\n`);
 }
+function parseMediaStatusRequestId(url) {
+    if (!url) {
+        return null;
+    }
+    const path = url.split('?')[0] ?? '';
+    const match = path.match(/^\/media\/requests\/([^/]+)\/status$/i);
+    if (!match?.[1]) {
+        return null;
+    }
+    try {
+        return decodeURIComponent(match[1]);
+    }
+    catch {
+        return match[1];
+    }
+}
 function parseJsonBody(text) {
     if (text.trim().length === 0) {
         return null;
@@ -108,6 +125,25 @@ export async function startBackendServer(options = {}) {
         if (request.method === 'GET' && request.url === '/health') {
             writeJson(response, 200, createBackendHealth());
             return;
+        }
+        if (request.method === 'GET') {
+            const requestId = parseMediaStatusRequestId(request.url);
+            if (requestId) {
+                try {
+                    const status = await getHiggsfieldGenerationStatus(requestId);
+                    writeJson(response, 200, {
+                        ...status,
+                    });
+                }
+                catch (error) {
+                    writeJson(response, 502, {
+                        requestId,
+                        status: 'failed',
+                        error: error instanceof Error ? error.message : 'Failed to fetch media generation status.',
+                    });
+                }
+                return;
+            }
         }
         if (request.method === 'POST' && request.url === '/agent/turn') {
             let payload;
