@@ -1,6 +1,5 @@
 // geminiClient.ts — AI-First Canvas Planner
-// Replace the previous heuristic+template approach with a single planner AI call.
-// Geometry is fully deterministic; AI owns content, structure, and layout choice.
+// Supports: sticky notes, geo shapes, text labels, bound arrows, update, delete
 
 import type {
   AgentStreamEvent,
@@ -19,11 +18,17 @@ import { createToolEnvelope } from './tools.js';
 
 const geminiApiBaseUrl = 'https://generativelanguage.googleapis.com/v1beta';
 const defaultGeminiModel = 'gemini-2.5-flash';
-const defaultTimeoutMs = 20_000;
-const defaultMaxToolsPerTurn = 15;
-const defaultMaxOutputTokens = 4096;
+const defaultTimeoutMs = 45_000;
+const defaultMaxToolsPerTurn = 20;
+const defaultMaxOutputTokens = 8192;
 
-const VIEWPORT_MARGIN = 60;
+// Default sticky dimensions (note shape)
+const STICKY_W = 200;
+const STICKY_H = 120;
+// Default geo dimensions when AI doesn't specify
+const DEFAULT_GEO_W = 160;
+const DEFAULT_GEO_H = 80;
+
 const MAX_NODE_TEXT = 300;
 const MAX_MESSAGE_TEXT = 2000;
 const MAX_NODES_HARD = 32;
@@ -32,32 +37,64 @@ const MAX_NODES_HARD = 32;
 // AIPlan contract
 // ---------------------------------------------------------------------------
 
-type LayoutKind = 'hub' | 'linear' | 'grid' | 'free';
-type NodeRole = 'title' | 'point' | 'note' | 'takeaway';
+export type NodeType = 'sticky' | 'text' | 'geo';
+export type GeoShape =
+  | 'rectangle'
+  | 'ellipse'
+  | 'diamond'
+  | 'triangle'
+  | 'parallelogram'
+  | 'cloud'
+  | 'hexagon';
+export type ShapeColor =
+  | 'black' | 'grey' | 'light-violet' | 'violet' | 'blue' | 'light-blue'
+  | 'yellow' | 'orange' | 'green' | 'light-green' | 'light-red' | 'red';
 
 export interface AIPlanNode {
   key: string;
+  type: NodeType;          // 'sticky' | 'text' | 'geo'
   text: string;
-  role: NodeRole;
+  x: number;               // center-x in canvas space
+  y: number;               // center-y in canvas space
+  // geo-specific
+  shape?: GeoShape;        // only for type='geo'
+  w?: number;              // width  (default: 160 for geo)
+  h?: number;              // height (default:  80 for geo)
+  color?: ShapeColor;      // tldraw color token
 }
 
 export interface AIPlanEdge {
-  from: string;
-  to: string;
+  from: string;            // node key
+  to: string;              // node key
+  label?: string;          // optional arrow label
+}
+
+/** Update or move an existing shape already on the canvas. */
+export interface AIPlanUpdate {
+  id: string;              // tldraw shape id (from canvas context)
+  text?: string;           // new text/label
+  x?: number;              // new center-x (optional)
+  y?: number;              // new center-y (optional)
+}
+
+/** Delete an existing shape from the canvas. */
+export interface AIPlanDelete {
+  id: string;              // tldraw shape id (from canvas context)
+}
+
+/** Group related shapes so they can be moved together. */
+export interface AIPlanCluster {
+  shapeIds: string[];      // node keys or existing canvas shape ids
+  label?: string;          // optional group label
 }
 
 export interface AIPlan {
-  message?: string;       // plain text reply (conversational mode)
-  layout: LayoutKind;
+  message?: string;        // conversational reply (omit when drawing)
   nodes: AIPlanNode[];
   edges: AIPlanEdge[];
-}
-
-// Internal resolved position
-interface ResolvedNode extends AIPlanNode {
-  x: number;
-  y: number;
-  shapeId: string;
+  updates?: AIPlanUpdate[];
+  deletes?: AIPlanDelete[];
+  clusters?: AIPlanCluster[];
 }
 
 // Internal tool call
@@ -99,7 +136,7 @@ function getConfiguredMaxToolsPerTurn(): number {
 }
 
 // ---------------------------------------------------------------------------
-// Canvas context helpers (reused from original)
+// Canvas context helpers
 // ---------------------------------------------------------------------------
 
 function extractRichText(richText: unknown): string {
@@ -132,117 +169,515 @@ function extractTextFromShape(record: Record<string, unknown>): string {
   return '';
 }
 
-function buildCanvasContextSummary(request: AgentTurnRequest): string {
+interface ContextShapeLayout {
+  id: string;
+  type: string;
+  text: string;
+  centerX: number;
+  centerY: number;
+  width: number;
+  height: number;
+}
+
+interface OccupiedBox {
+  id: string;
+  x: number;
+  y: number;
+  hw: number;
+  hh: number;
+}
+
+function toFiniteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function toPositiveFiniteNumber(value: unknown): number | undefined {
+  const n = toFiniteNumber(value);
+  return n !== undefined && n > 0 ? n : undefined;
+}
+
+function inferFallbackShapeSize(shapeType: string, props: Record<string, unknown>): { width: number; height: number } {
+  const lowerType = shapeType.toLowerCase();
+  if (lowerType === 'note' || lowerType === 'sticky') {
+    return { width: STICKY_W, height: STICKY_H };
+  }
+  if (lowerType === 'geo') {
+    return {
+      width: toPositiveFiniteNumber(props.w) ?? DEFAULT_GEO_W,
+      height: toPositiveFiniteNumber(props.h) ?? DEFAULT_GEO_H,
+    };
+  }
+  if (lowerType === 'text') {
+    return { width: 120, height: 40 };
+  }
+  return {
+    width: toPositiveFiniteNumber(props.w) ?? 160,
+    height: toPositiveFiniteNumber(props.h) ?? 100,
+  };
+}
+
+function parseContextShapeLayout(shape: unknown): ContextShapeLayout | null {
+  if (typeof shape !== 'object' || shape === null) {
+    return null;
+  }
+
+  const record = shape as Record<string, unknown>;
+  const id = typeof record.id === 'string' ? record.id.trim() : '';
+  if (!id) {
+    return null;
+  }
+
+  const type =
+    typeof record.type === 'string'
+      ? record.type
+      : typeof record.kind === 'string'
+        ? record.kind
+        : 'unknown';
+  const props =
+    typeof record.props === 'object' && record.props !== null
+      ? (record.props as Record<string, unknown>)
+      : {};
+  const fallbackSize = inferFallbackShapeSize(type, props);
+
+  let width = fallbackSize.width;
+  let height = fallbackSize.height;
+  let centerX: number | undefined;
+  let centerY: number | undefined;
+
+  const bounds =
+    typeof record.bounds === 'object' && record.bounds !== null
+      ? (record.bounds as Record<string, unknown>)
+      : null;
+  const boundsX = toFiniteNumber(bounds?.x);
+  const boundsY = toFiniteNumber(bounds?.y);
+  const boundsW = toPositiveFiniteNumber(bounds?.width ?? bounds?.w);
+  const boundsH = toPositiveFiniteNumber(bounds?.height ?? bounds?.h);
+
+  if (boundsX !== undefined && boundsY !== undefined && boundsW !== undefined && boundsH !== undefined) {
+    width = boundsW;
+    height = boundsH;
+    centerX = boundsX + boundsW / 2;
+    centerY = boundsY + boundsH / 2;
+  } else {
+    const rawX = toFiniteNumber(record.x);
+    const rawY = toFiniteNumber(record.y);
+    width = toPositiveFiniteNumber(record.width ?? record.w ?? props.w) ?? fallbackSize.width;
+    height = toPositiveFiniteNumber(record.height ?? record.h ?? props.h) ?? fallbackSize.height;
+
+    if (rawX !== undefined && rawY !== undefined) {
+      centerX = rawX + width / 2;
+      centerY = rawY + height / 2;
+    }
+  }
+
+  if (centerX === undefined || centerY === undefined) {
+    return null;
+  }
+
+  return {
+    id,
+    type,
+    text: extractTextFromShape(record),
+    centerX,
+    centerY,
+    width,
+    height,
+  };
+}
+
+function getContextShapeLayouts(request: AgentTurnRequest): ContextShapeLayout[] {
   const rawContext = request.context as AgentTurnRequest['context'] & { shapes?: unknown };
   const shapes = Array.isArray(rawContext.shapes) ? rawContext.shapes : [];
+  return shapes
+    .map((shape) => parseContextShapeLayout(shape))
+    .filter((shape): shape is ContextShapeLayout => shape !== null);
+}
 
-  if (shapes.length === 0) return 'Canvas is empty.';
+function hasBoxCollision(candidate: OccupiedBox, occupied: OccupiedBox[], padding: number): boolean {
+  return occupied.some((box) => {
+    const minGapX = candidate.hw + box.hw + padding;
+    const minGapY = candidate.hh + box.hh + padding;
+    return Math.abs(candidate.x - box.x) < minGapX && Math.abs(candidate.y - box.y) < minGapY;
+  });
+}
 
-  const previews = shapes
-    .slice(0, 32)
-    .map((shape) => {
-      if (typeof shape !== 'object' || shape === null) return null;
-      const r = shape as Record<string, unknown>;
-      const kind = typeof r.type === 'string' ? r.type : 'unknown';
-      const text = extractTextFromShape(r).slice(0, 120);
-      return text ? `${kind}: "${text}"` : null;
-    })
-    .filter((s): s is string => s !== null);
+function findNonCollidingBoxPosition(
+  candidate: OccupiedBox,
+  occupied: OccupiedBox[],
+  viewport: AgentTurnRequest['context']['viewport'],
+  padding: number = 48,
+  maxAttempts: number = 24,
+): { x: number; y: number } {
+  const minX = viewport.x + candidate.hw + padding;
+  const maxX = viewport.x + viewport.width - candidate.hw - padding;
+  const minY = viewport.y + candidate.hh + padding;
+  const maxY = viewport.y + viewport.height - candidate.hh - padding;
 
-  return previews.length > 0
-    ? `Canvas has ${shapes.length} shape(s). Sample: ${previews.slice(0, 6).join(' | ')}`
-    : `Canvas has ${shapes.length} shape(s) with no text.`;
+  const clamped: OccupiedBox = {
+    ...candidate,
+    x: clamp(candidate.x, minX, maxX),
+    y: clamp(candidate.y, minY, maxY),
+  };
+
+  if (!hasBoxCollision(clamped, occupied, padding)) {
+    return { x: clamped.x, y: clamped.y };
+  }
+
+  const baseGap = Math.max(candidate.hw * 2, candidate.hh * 2) + padding;
+
+  for (let attempt = 1; attempt < maxAttempts; attempt++) {
+    const angle = (attempt * Math.PI) / 4;
+    const distance = baseGap * (1 + attempt * 0.35);
+    const testX = clamp(Math.round(clamped.x + Math.cos(angle) * distance), minX, maxX);
+    const testY = clamp(Math.round(clamped.y + Math.sin(angle) * distance), minY, maxY);
+    const test: OccupiedBox = { ...clamped, x: testX, y: testY };
+    if (!hasBoxCollision(test, occupied, padding)) {
+      return { x: testX, y: testY };
+    }
+  }
+
+  const stepX = candidate.hw * 2 + padding;
+  const stepY = candidate.hh * 2 + padding;
+  for (let gx = minX; gx <= maxX; gx += stepX) {
+    for (let gy = minY; gy <= maxY; gy += stepY) {
+      const test: OccupiedBox = { ...clamped, x: gx, y: gy };
+      if (!hasBoxCollision(test, occupied, padding)) {
+        return { x: gx, y: gy };
+      }
+    }
+  }
+
+  return { x: clamped.x, y: clamped.y };
+}
+
+/**
+ * Build a richer canvas context that includes shape IDs and positions so the
+ * AI can reference existing shapes for updates and deletes.
+ */
+function buildCanvasContextSummary(request: AgentTurnRequest, contextShapes: ContextShapeLayout[] = getContextShapeLayouts(request)): string {
+  const rawContext = request.context as AgentTurnRequest['context'] & { shapes?: unknown };
+  const totalShapes = Array.isArray(rawContext.shapes) ? rawContext.shapes.length : contextShapes.length;
+  if (totalShapes === 0) return 'Canvas is empty.';
+
+  const lines: string[] = [`Canvas has ${totalShapes} shape(s):`];
+
+  contextShapes.slice(0, 48).forEach((shape) => {
+    const text = shape.text.slice(0, 80);
+    const label = text ? ` "${text}"` : ' (no text)';
+    lines.push(
+      `  id=${shape.id} type=${shape.type}${label} @ (${Math.round(shape.centerX)},${Math.round(shape.centerY)}) size=${Math.round(shape.width)}x${Math.round(shape.height)}`,
+    );
+  });
+
+  if (contextShapes.length > 48) {
+    lines.push(`  ... and ${contextShapes.length - 48} more parsed shapes not shown.`);
+  }
+
+  if (totalShapes > contextShapes.length) {
+    lines.push(`  ... ${totalShapes - contextShapes.length} shape(s) had incomplete bounds and were omitted from summary.`);
+  }
+
+  return lines.join('\n');
 }
 
 // ---------------------------------------------------------------------------
 // System prompt
 // ---------------------------------------------------------------------------
 
-function buildActionRulesPromptSection(): string {
-  return `## Canvas actions
+function buildSystemPrompt(viewport: AgentTurnRequest['context']['viewport']): string {
+  const { x, y, width, height } = viewport;
+  const cx = Math.round(x + width / 2);
+  const cy = Math.round(y + height / 2);
 
-The app turns your JSON output into editor operations through action utils, so focus on intent and structure rather than low-level geometry.
+  const minX = x + STICKY_W / 2 + 20;
+  const maxX = x + width - STICKY_W / 2 - 20;
+  const minY = y + STICKY_H / 2 + 20;
+  const maxY = y + height - STICKY_H / 2 - 20;
 
-Available action vocabulary:
-- \`place_sticky\`: create a note-like canvas item for a single idea.
-- \`draw_arrow\`: connect two existing items with a relationship arrow.
-- \`cluster_shapes\`: group related items into a visual cluster when that helps comprehension.
-- \`summarize_region\`: compress a crowded area into a compact summary note.
-- \`generate_image\`: reserve a placeholder for an image when the user explicitly wants one.
-
-Action rules:
-- Use the smallest action set that solves the request.
-- Prefer clear relationships over decorative complexity.
-- Keep text short enough to fit comfortably in the resulting canvas item.
-- Only reference ids that already exist in your JSON output.
-- Do not invent unsupported action names or extra response fields.`.trim();
-}
-
-function buildSystemPrompt(): string {
   return `
-You are an AI canvas planner. Given a user prompt, decide what to create on a collaborative canvas.
+You are a canvas layout AI for a tldraw whiteboard. Given a user request, decide what to create,
+update, or delete on the canvas and exactly where.
 
 Return ONLY a valid JSON object. No markdown, no code fences, no explanation — raw JSON only.
 
-${buildActionRulesPromptSection()}
+═══════════════════════════════════════════
+CANVAS INFO
+═══════════════════════════════════════════
+Visible area: x=${x}, y=${y}, width=${width}, height=${height}
+Center: (${cx}, ${cy})
+Coordinate origin is the top-left of the page (positive y goes DOWN).
+All x/y coordinates you output are the CENTER of the shape.
+Valid center range: x ∈ [${minX}, ${maxX}], y ∈ [${minY}, ${maxY}]
 
-Schema:
+═══════════════════════════════════════════
+SHAPE TYPES — choose the right one
+═══════════════════════════════════════════
+
+1. "sticky" — Colored sticky note (${STICKY_W}×${STICKY_H}px). Best for: brainstorming, ideas, notes.
+   Fields: key, type, text, x, y, color(optional)
+
+2. "geo" — Geometric shape with a text label. Best for: flowcharts, diagrams, structured content.
+   Fields: key, type, text, x, y, shape, w(optional), h(optional), color(optional)
+   shape values: "rectangle" | "ellipse" | "diamond" | "triangle" | "parallelogram" | "cloud" | "hexagon"
+   Default size: w=160, h=80. For process boxes use w=160,h=80. For decision diamonds use w=140,h=100.
+
+3. "text" — Plain floating text label. Best for: headings, section titles, annotations.
+   Fields: key, type, text, x, y, color(optional)
+   Text shapes auto-size; no w/h needed.
+
+Available colors: "black" | "grey" | "blue" | "light-blue" | "violet" | "light-violet"
+                  | "red" | "light-red" | "orange" | "yellow" | "green" | "light-green"
+
+═══════════════════════════════════════════
+SPACING RULES
+═══════════════════════════════════════════
+- Shapes must NOT overlap. Leave at least 20px gap between shape edges.
+- For stickies: gap between centers ≥ ${STICKY_W + 20}px horizontally, ${STICKY_H + 20}px vertically.
+- For geo shapes: gap = shape dimensions + 30px padding.
+- Spread across the full canvas — do NOT cluster everything in the center.
+- Timelines / sequences: left-to-right OR top-to-bottom with even spacing.
+- Mind maps: main topic at center, spokes radiate outward.
+- Flowcharts: top-to-bottom, nodes aligned in columns.
+- Comparison grids: align in rows and columns.
+
+═══════════════════════════════════════════
+ARROWS (edges)
+═══════════════════════════════════════════
+Arrows bind directly to shapes — you only specify source and target keys.
+tldraw calculates the exact entry/exit points automatically.
+- Sequences/timelines: connect each step to the next.
+- Mind maps: hub → each spoke.
+- Flowcharts: connect every decision branch.
+- Comparisons: omit arrows unless they add meaning.
+- label (optional): short text shown on the arrow (e.g., "yes", "no", "calls").
+
+═══════════════════════════════════════════
+UPDATES — editing existing shapes
+═══════════════════════════════════════════
+Use "updates" to change or move shapes already on the canvas.
+Reference the shape's exact id from the canvas context.
+You can change text, x, y, or any combination.
+
+═══════════════════════════════════════════
+DELETES — removing existing shapes
+═══════════════════════════════════════════
+Use "deletes" to remove shapes by id. Only delete shapes that appear in the canvas context.
+
+═══════════════════════════════════════════
+GROUPING — group related shapes together
+═══════════════════════════════════════════
+Use "clusters" to group related shapes so they move together.
+- shapeIds can reference node keys you create in this plan and/or existing canvas shape ids.
+- Prefer grouping only when the user asks to group or keep elements together.
+- For grouping existing content, use exact ids from canvas context.
+
+═══════════════════════════════════════════
+OUTPUT SCHEMA
+═══════════════════════════════════════════
 {
-  "message": "<optional plain text — only for conversational replies>",
-  "layout": "<hub | linear | grid | free>",
+  "message": "<only for conversational replies — omit when placing/editing shapes>",
   "nodes": [
-    { "key": "<unique_snake_case_id>", "text": "<content>", "role": "<title | point | note | takeaway>" }
+    { "key": "<unique_id>", "type": "sticky|geo|text", "text": "<label>",
+      "x": <number>, "y": <number>,
+      "shape": "<geo_shape>",   // geo only
+      "w": <number>,            // geo only, optional
+      "h": <number>,            // geo only, optional
+      "color": "<color>"        // optional
+    }
   ],
   "edges": [
-    { "from": "<key>", "to": "<key>" }
+    { "from": "<key>", "to": "<key>", "label": "<optional>" }
+  ],
+  "updates": [
+    { "id": "<existing_shape_id>", "text": "<new_text>", "x": <number>, "y": <number> }
+  ],
+  "deletes": [
+    { "id": "<existing_shape_id>" }
+  ],
+  "clusters": [
+    { "shapeIds": ["<node_key_or_shape_id>", "<node_key_or_shape_id>"], "label": "<optional>" }
   ]
 }
 
-Layout rules:
-- hub: Use for mind maps, topic exploration. One "title" node in center, others radiate outward.
-- linear: Use for steps, timelines, sequences. Nodes flow top to bottom in order.
-- grid: Use for comparisons, lists, pros/cons. Nodes arranged in columns.
-- free: Use only when no other layout fits. Nodes spread without specific order.
+═══════════════════════════════════════════
+RULES
+═══════════════════════════════════════════
+- Maximum 12 new nodes per turn.
+- Node text: short and specific — no filler words.
+- Edges: only reference keys that exist in your nodes list.
+- Conversational mode (user is chatting, not asking for canvas content):
+  set nodes=[], edges=[], omit updates/deletes/clusters, put reply in "message".
+- Canvas mode: omit "message" entirely.
+- You can mix creates + updates + deletes + clusters in one response.
+- Do not invent shape IDs for updates/deletes — use exact ids from the canvas context.
 
-Node rules:
-- Every plan must have at most one "title" role node.
-- Use "point" for body items, "takeaway" for conclusions, "note" for asides.
-- Keep node text short and specific. No filler phrases.
-- Maximum 12 nodes.
+═══════════════════════════════════════════
+WHEN TO USE EACH SHAPE TYPE
+═══════════════════════════════════════════
+- Brainstorming / ideas / notes         → sticky
+- Flowchart / process / decision tree   → geo (rectangle, diamond)
+- Timeline / sequence of events         → sticky (or geo rectangle)
+- Mind map hub                          → geo (ellipse or rectangle)
+- Mind map spokes                       → sticky
+- Section headings / labels             → text
+- Database / cylinder entity            → geo (could use rectangle)
+- Swim lane titles                      → text
 
-Edge rules:
-- Only create edges between keys that exist in your nodes list.
-- For "hub": connect title → each point.
-- For "linear": connect each node to the next in sequence.
-- For "grid": no edges unless meaningful.
-- Omit edges array if empty.
+═══════════════════════════════════════════
+EXAMPLES
+═══════════════════════════════════════════
 
-Conversational mode:
-- If the user is chatting, asking a meta question, or not requesting canvas content, set nodes to [] and edges to [] and put your full response in "message".
-- Do NOT set message when you are creating canvas content.
+Prompt: "flowchart for user login" →
+{
+  "nodes": [
+    { "key": "start",    "type": "geo", "shape": "ellipse",   "text": "Start",                 "x": ${cx},       "y": ${cy - 280}, "w": 100, "h": 60,  "color": "green" },
+    { "key": "enter",    "type": "geo", "shape": "rectangle", "text": "Enter credentials",      "x": ${cx},       "y": ${cy - 160}, "w": 180, "h": 80 },
+    { "key": "valid",    "type": "geo", "shape": "diamond",   "text": "Valid?",                 "x": ${cx},       "y": ${cy - 20},  "w": 140, "h": 100 },
+    { "key": "home",     "type": "geo", "shape": "rectangle", "text": "Redirect to home",       "x": ${cx + 200}, "y": ${cy + 120}, "w": 180, "h": 80,  "color": "blue" },
+    { "key": "error",    "type": "geo", "shape": "rectangle", "text": "Show error message",     "x": ${cx - 200}, "y": ${cy + 120}, "w": 180, "h": 80,  "color": "red" },
+    { "key": "end",      "type": "geo", "shape": "ellipse",   "text": "End",                   "x": ${cx + 200}, "y": ${cy + 240}, "w": 100, "h": 60,  "color": "green" }
+  ],
+  "edges": [
+    { "from": "start", "to": "enter" },
+    { "from": "enter", "to": "valid" },
+    { "from": "valid", "to": "home",  "label": "yes" },
+    { "from": "valid", "to": "error", "label": "no" },
+    { "from": "home",  "to": "end" }
+  ]
+}
 
-Examples:
-Prompt: "explain why sleep is important" →
-{ "layout": "hub", "nodes": [ {"key":"title","text":"Why Sleep Matters","role":"title"}, {"key":"p1","text":"Consolidates memory","role":"point"}, {"key":"p2","text":"Repairs muscle tissue","role":"point"}, {"key":"p3","text":"Regulates mood","role":"point"}, {"key":"takeaway","text":"7-9 hours is non-negotiable","role":"takeaway"} ], "edges": [{"from":"title","to":"p1"},{"from":"title","to":"p2"},{"from":"title","to":"p3"}] }
+Prompt: "timeline of WW2" →
+{
+  "nodes": [
+    { "key": "e1", "type": "sticky", "text": "1939 — Germany invades Poland, war begins",    "x": ${cx - 500}, "y": ${cy} },
+    { "key": "e2", "type": "sticky", "text": "1940 — Fall of France, Battle of Britain",      "x": ${cx - 300}, "y": ${cy} },
+    { "key": "e3", "type": "sticky", "text": "1941 — Pearl Harbor, USA enters war",           "x": ${cx - 100}, "y": ${cy} },
+    { "key": "e4", "type": "sticky", "text": "1943 — Stalingrad, turning point",              "x": ${cx + 100}, "y": ${cy} },
+    { "key": "e5", "type": "sticky", "text": "1944 — D-Day landings",                         "x": ${cx + 300}, "y": ${cy} },
+    { "key": "e6", "type": "sticky", "text": "1945 — Victory in Europe and Pacific",          "x": ${cx + 500}, "y": ${cy} }
+  ],
+  "edges": [
+    {"from":"e1","to":"e2"},{"from":"e2","to":"e3"},{"from":"e3","to":"e4"},{"from":"e4","to":"e5"},{"from":"e5","to":"e6"}
+  ]
+}
 
-Prompt: "steps to launch a startup" →
-{ "layout": "linear", "nodes": [ {"key":"s1","text":"Validate the problem","role":"title"}, {"key":"s2","text":"Build an MVP","role":"point"}, {"key":"s3","text":"Get 10 paying users","role":"point"}, {"key":"s4","text":"Iterate on feedback","role":"point"}, {"key":"s5","text":"Scale distribution","role":"takeaway"} ], "edges": [{"from":"s1","to":"s2"},{"from":"s2","to":"s3"},{"from":"s3","to":"s4"},{"from":"s4","to":"s5"}] }
+Prompt: "add a title saying Project Roadmap at the top" →
+{
+  "nodes": [
+    { "key": "title", "type": "text", "text": "Project Roadmap", "x": ${cx}, "y": ${y + 40}, "color": "black" }
+  ],
+  "edges": []
+}
+
+Prompt: "change the text of shape:abc123 to 'Done'" →
+{
+  "nodes": [],
+  "edges": [],
+  "updates": [{ "id": "shape:abc123", "text": "Done" }]
+}
+
+Prompt: "delete shape:xyz789" →
+{
+  "nodes": [],
+  "edges": [],
+  "deletes": [{ "id": "shape:xyz789" }]
+}
+
+Prompt: "group onboarding notes together" →
+{
+  "nodes": [
+    { "key": "n1", "type": "sticky", "text": "Sign up", "x": ${cx - 260}, "y": ${cy} },
+    { "key": "n2", "type": "sticky", "text": "Verify email", "x": ${cx - 20}, "y": ${cy} },
+    { "key": "n3", "type": "sticky", "text": "Complete profile", "x": ${cx + 220}, "y": ${cy} }
+  ],
+  "edges": [
+    { "from": "n1", "to": "n2" },
+    { "from": "n2", "to": "n3" }
+  ],
+  "clusters": [
+    { "shapeIds": ["n1", "n2", "n3"], "label": "Onboarding" }
+  ]
+}
 
 Prompt: "what can you do?" →
-{ "layout": "free", "nodes": [], "edges": [], "message": "I can create mind maps, step-by-step flows, comparison grids, or freeform notes. Just describe what you want on the canvas." }
+{ "nodes": [], "edges": [], "message": "I can create timelines, flowcharts, mind maps, comparison grids, and free-form notes. I can also add arrows between shapes, add text headings, and edit or delete shapes already on the canvas. What would you like to build?" }
 `.trim();
 }
 
 // ---------------------------------------------------------------------------
-// AIPlan validation and sanitization
+// Sanitize and validate
 // ---------------------------------------------------------------------------
-
-const ALLOWED_LAYOUTS: Set<string> = new Set(['hub', 'linear', 'grid', 'free']);
-const ALLOWED_ROLES: Set<string> = new Set(['title', 'point', 'note', 'takeaway']);
 
 function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 3)}...`;
 }
+
+function normalizeKey(key: string): string {
+  return key
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 32) || 'node';
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+/** Half-dimensions for a node (used for collision detection). */
+function halfDims(node: AIPlanNode): { hw: number; hh: number } {
+  if (node.type === 'sticky') return { hw: STICKY_W / 2, hh: STICKY_H / 2 };
+  if (node.type === 'geo') {
+    return {
+      hw: (node.w ?? DEFAULT_GEO_W) / 2,
+      hh: (node.h ?? DEFAULT_GEO_H) / 2,
+    };
+  }
+  // text: small footprint
+  return { hw: 60, hh: 20 };
+}
+
+function findNonCollidingPosition(
+  candidate: AIPlanNode,
+  existing: AIPlanNode[],
+  viewport: AgentTurnRequest['context']['viewport'],
+  padding: number = 20,
+  maxAttempts: number = 24,
+  occupiedBoxes: OccupiedBox[] = [],
+): { x: number; y: number } {
+  const { hw, hh } = halfDims(candidate);
+  const candidateBox: OccupiedBox = {
+    id: `node:${candidate.key}`,
+    x: candidate.x,
+    y: candidate.y,
+    hw,
+    hh,
+  };
+  const existingBoxes: OccupiedBox[] = [
+    ...existing.map((node) => {
+      const dims = halfDims(node);
+      return {
+        id: `node:${node.key}`,
+        x: node.x,
+        y: node.y,
+        hw: dims.hw,
+        hh: dims.hh,
+      };
+    }),
+    ...occupiedBoxes,
+  ];
+  return findNonCollidingBoxPosition(candidateBox, existingBoxes, viewport, padding, maxAttempts);
+}
+
+const VALID_NODE_TYPES = new Set<string>(['sticky', 'text', 'geo']);
+const VALID_GEO_SHAPES = new Set<string>([
+  'rectangle', 'ellipse', 'diamond', 'triangle', 'parallelogram', 'cloud', 'hexagon',
+]);
+const VALID_COLORS = new Set<string>([
+  'black', 'grey', 'light-violet', 'violet', 'blue', 'light-blue',
+  'yellow', 'orange', 'green', 'light-green', 'light-red', 'red',
+]);
 
 function stripMarkdownFences(value: string): string {
   const trimmed = value.trim();
@@ -250,114 +685,232 @@ function stripMarkdownFences(value: string): string {
   return match?.[1] !== undefined ? match[1].trim() : trimmed;
 }
 
-function sanitizeAndValidatePlan(raw: unknown, maxNodes: number): AIPlan | null {
+function sanitizeAndValidatePlan(
+  raw: unknown,
+  viewport: AgentTurnRequest['context']['viewport'],
+  maxNodes: number,
+  contextShapes: ContextShapeLayout[] = [],
+): AIPlan | null {
   if (typeof raw !== 'object' || raw === null) return null;
-
   const obj = raw as Record<string, unknown>;
 
-  // Layout
-  const layout = typeof obj.layout === 'string' && ALLOWED_LAYOUTS.has(obj.layout)
-    ? (obj.layout as LayoutKind)
-    : null;
-  if (layout === null) return null;
+  const message =
+    typeof obj.message === 'string' && obj.message.trim().length > 0
+      ? truncate(obj.message.trim(), MAX_MESSAGE_TEXT)
+      : undefined;
 
-  // Message
-  const message = typeof obj.message === 'string' && obj.message.trim().length > 0
-    ? truncate(obj.message.trim(), MAX_MESSAGE_TEXT)
-    : undefined;
+  const { x, y, width, height } = viewport;
+  const minX = x + STICKY_W / 2 + 20;
+  const maxX = x + width - STICKY_W / 2 - 20;
+  const minY = y + STICKY_H / 2 + 20;
+  const maxY = y + height - STICKY_H / 2 - 20;
 
-  // Nodes
+  // ── Nodes ──────────────────────────────────────────────────────────────────
   const rawNodes = Array.isArray(obj.nodes) ? obj.nodes : [];
   const seenKeys = new Set<string>();
-  let titleCount = 0;
+  const placedNodes: AIPlanNode[] = [];
+  const occupiedContextBoxes: OccupiedBox[] = contextShapes.map((shape) => ({
+    id: shape.id,
+    x: shape.centerX,
+    y: shape.centerY,
+    hw: Math.max(1, shape.width / 2),
+    hh: Math.max(1, shape.height / 2),
+  }));
 
-  const nodes: AIPlanNode[] = rawNodes
-    .slice(0, Math.min(MAX_NODES_HARD, maxNodes))
-    .map((n): AIPlanNode | null => {
-      if (typeof n !== 'object' || n === null) return null;
-      const nr = n as Record<string, unknown>;
-      const key = typeof nr.key === 'string' ? nr.key.trim() : '';
-      const text = typeof nr.text === 'string' ? truncate(nr.text.trim(), MAX_NODE_TEXT) : '';
-      const role = typeof nr.role === 'string' && ALLOWED_ROLES.has(nr.role) ? (nr.role as NodeRole) : 'point';
+  for (const n of rawNodes.slice(0, Math.min(MAX_NODES_HARD, maxNodes))) {
+    if (typeof n !== 'object' || n === null) continue;
+    const nr = n as Record<string, unknown>;
 
-      if (key.length === 0 || text.length === 0) return null;
-      if (seenKeys.has(key)) return null;
-      if (role === 'title') {
-        if (titleCount > 0) return null; // only one title allowed
-        titleCount++;
-      }
+    const rawKey = typeof nr.key === 'string' ? nr.key.trim() : '';
+    const key = normalizeKey(rawKey);
+    if (key.length === 0 || seenKeys.has(key)) continue;
 
-      seenKeys.add(key);
-      return { key, text, role };
-    })
-    .filter((n): n is AIPlanNode => n !== null);
+    const rawType = typeof nr.type === 'string' ? nr.type.trim().toLowerCase() : 'sticky';
+    const type: NodeType = VALID_NODE_TYPES.has(rawType) ? (rawType as NodeType) : 'sticky';
 
-  // Enforce mutual exclusivity: message → no nodes; nodes → no message.
-  // A plan with message AND nodes is ambiguous — treat it as canvas-only and drop the message.
-  // A plan with message AND no nodes is conversational — pass through.
-  // A plan with no message AND no nodes is invalid — neither mode applies.
-  const isConversational = message !== undefined && nodes.length === 0;
-  const isCanvas = nodes.length > 0;
+    const text = typeof nr.text === 'string' ? truncate(nr.text.trim(), MAX_NODE_TEXT) : '';
+    if (text.length === 0) continue;
 
-  if (!isConversational && !isCanvas) {
-    // Empty canvas plan with no message — model did nothing meaningful.
-    return null;
+    const rawX = typeof nr.x === 'number' ? nr.x : null;
+    const rawY = typeof nr.y === 'number' ? nr.y : null;
+    if (rawX === null || rawY === null || !Number.isFinite(rawX) || !Number.isFinite(rawY)) continue;
+
+    const color =
+      typeof nr.color === 'string' && VALID_COLORS.has(nr.color) ? (nr.color as ShapeColor) : undefined;
+
+    let node: AIPlanNode = {
+      key,
+      type,
+      text,
+      x: clamp(rawX, minX, maxX),
+      y: clamp(rawY, minY, maxY),
+      color,
+    };
+
+    if (type === 'geo') {
+      const rawShape = typeof nr.shape === 'string' ? nr.shape.trim().toLowerCase() : 'rectangle';
+      node.shape = VALID_GEO_SHAPES.has(rawShape) ? (rawShape as GeoShape) : 'rectangle';
+      const rawW = typeof nr.w === 'number' && nr.w > 0 ? nr.w : DEFAULT_GEO_W;
+      const rawH = typeof nr.h === 'number' && nr.h > 0 ? nr.h : DEFAULT_GEO_H;
+      node.w = Math.round(clamp(rawW, 40, 600));
+      node.h = Math.round(clamp(rawH, 30, 400));
+    }
+
+    const resolved = findNonCollidingPosition(node, placedNodes, viewport, 20, 24, occupiedContextBoxes);
+    node = { ...node, x: resolved.x, y: resolved.y };
+
+    seenKeys.add(key);
+    placedNodes.push(node);
   }
 
-  // If canvas content is present, message must be absent (drop it silently).
-  const finalMessage = isCanvas ? undefined : message;
-
-  // Edges — filter out any with unknown keys
+  // ── Edges ──────────────────────────────────────────────────────────────────
   const rawEdges = Array.isArray(obj.edges) ? obj.edges : [];
   const edges: AIPlanEdge[] = rawEdges
     .map((e): AIPlanEdge | null => {
       if (typeof e !== 'object' || e === null) return null;
       const er = e as Record<string, unknown>;
-      const from = typeof er.from === 'string' ? er.from.trim() : '';
-      const to = typeof er.to === 'string' ? er.to.trim() : '';
+      const from = normalizeKey(typeof er.from === 'string' ? er.from : '');
+      const to = normalizeKey(typeof er.to === 'string' ? er.to : '');
+      if (!from || !to) return null;
       if (!seenKeys.has(from) || !seenKeys.has(to) || from === to) return null;
-      return { from, to };
+      const label =
+        typeof er.label === 'string' && er.label.trim().length > 0
+          ? truncate(er.label.trim(), 60)
+          : undefined;
+      return { from, to, label };
     })
     .filter((e): e is AIPlanEdge => e !== null);
 
-  return { message: finalMessage, layout, nodes, edges };
-}
+  // ── Updates ────────────────────────────────────────────────────────────────
+  const rawUpdates = Array.isArray(obj.updates) ? obj.updates : [];
+  const contextShapeById = new Map(contextShapes.map((shape) => [shape.id, shape]));
+  const occupiedForUpdates: OccupiedBox[] = [
+    ...occupiedContextBoxes,
+    ...placedNodes.map((node) => {
+      const dims = halfDims(node);
+      return {
+        id: `new:${node.key}`,
+        x: node.x,
+        y: node.y,
+        hw: dims.hw,
+        hh: dims.hh,
+      };
+    }),
+  ];
+  const updates: AIPlanUpdate[] = rawUpdates
+    .slice(0, 20)
+    .map((u): AIPlanUpdate | null => {
+      if (typeof u !== 'object' || u === null) return null;
+      const ur = u as Record<string, unknown>;
+      const id = typeof ur.id === 'string' ? ur.id.trim() : '';
+      if (!id) return null;
+      const update: AIPlanUpdate = { id };
+      if (typeof ur.text === 'string') update.text = truncate(ur.text.trim(), MAX_NODE_TEXT);
+      if (typeof ur.x === 'number' && Number.isFinite(ur.x)) update.x = ur.x;
+      if (typeof ur.y === 'number' && Number.isFinite(ur.y)) update.y = ur.y;
 
-// ---------------------------------------------------------------------------
-// Edge inference — make hub and linear robust when model omits edges
-// ---------------------------------------------------------------------------
+      const hasPositionPatch = update.x !== undefined || update.y !== undefined;
+      if (hasPositionPatch) {
+        const target = contextShapeById.get(id);
+        if (target) {
+          const candidate: OccupiedBox = {
+            id,
+            x: update.x ?? target.centerX,
+            y: update.y ?? target.centerY,
+            hw: Math.max(1, target.width / 2),
+            hh: Math.max(1, target.height / 2),
+          };
+          const occupiedWithoutTarget = occupiedForUpdates.filter((box) => box.id !== id);
+          const resolved = findNonCollidingBoxPosition(candidate, occupiedWithoutTarget, viewport);
+          update.x = resolved.x;
+          update.y = resolved.y;
 
-function inferEdges(plan: AIPlan): AIPlanEdge[] {
-  if (plan.edges.length > 0) return plan.edges; // model provided them, trust it
+          const existingIndex = occupiedForUpdates.findIndex((box) => box.id === id);
+          if (existingIndex >= 0) {
+            occupiedForUpdates[existingIndex] = { ...candidate, x: resolved.x, y: resolved.y };
+          } else {
+            occupiedForUpdates.push({ ...candidate, x: resolved.x, y: resolved.y });
+          }
+        }
+      }
 
-  const keys = plan.nodes.map((n) => n.key);
-  if (keys.length < 2) return [];
+      if (!update.text && update.x === undefined && update.y === undefined) return null;
+      return update;
+    })
+    .filter((u): u is AIPlanUpdate => u !== null);
 
-  if (plan.layout === 'linear') {
-    // Chain: n0 → n1 → n2 → ...
-    return keys.slice(0, -1).map((from, i) => ({ from, to: keys[i + 1]! }));
-  }
+  // ── Deletes ────────────────────────────────────────────────────────────────
+  const rawDeletes = Array.isArray(obj.deletes) ? obj.deletes : [];
+  const deletes: AIPlanDelete[] = rawDeletes
+    .slice(0, 20)
+    .map((d): AIPlanDelete | null => {
+      if (typeof d !== 'object' || d === null) return null;
+      const dr = d as Record<string, unknown>;
+      const id = typeof dr.id === 'string' ? dr.id.trim() : '';
+      return id ? { id } : null;
+    })
+    .filter((d): d is AIPlanDelete => d !== null);
 
-  if (plan.layout === 'hub') {
-    // Title (or first node) → all others
-    const titleKey = plan.nodes.find((n) => n.role === 'title')?.key ?? keys[0]!;
-    return keys.filter((k) => k !== titleKey).map((to) => ({ from: titleKey, to }));
-  }
+  // ── Clusters ───────────────────────────────────────────────────────────────
+  const rawClusters = Array.isArray(obj.clusters) ? obj.clusters : [];
+  const clusters: AIPlanCluster[] = rawClusters
+    .slice(0, 20)
+    .map((c): AIPlanCluster | null => {
+      if (typeof c !== 'object' || c === null) return null;
+      const cr = c as Record<string, unknown>;
+      const shapeIds = Array.isArray(cr.shapeIds)
+        ? cr.shapeIds
+            .map((id) => (typeof id === 'string' ? id.trim() : ''))
+            .filter((id) => id.length > 0)
+        : [];
+      if (shapeIds.length < 2) return null;
+      const uniqueShapeIds = [...new Set(shapeIds)].slice(0, 20);
+      if (uniqueShapeIds.length < 2) return null;
+      const label =
+        typeof cr.label === 'string' && cr.label.trim().length > 0
+          ? truncate(cr.label.trim(), 80)
+          : undefined;
+      return { shapeIds: uniqueShapeIds, label };
+    })
+    .filter((c): c is AIPlanCluster => c !== null);
 
-  // grid / free: no edges by default
-  return [];
-}
+  // ── Mode detection ─────────────────────────────────────────────────────────
+  const hasCanvasOps =
+    placedNodes.length > 0 ||
+    edges.length > 0 ||
+    updates.length > 0 ||
+    deletes.length > 0 ||
+    clusters.length > 0;
+  const isConversational = message !== undefined && !hasCanvasOps;
 
+  if (!isConversational && !hasCanvasOps) return null;
 
-
-function buildFallbackPlan(prompt: string): AIPlan {
   return {
-    layout: 'free',
+    message: isConversational ? message : undefined,
+    nodes: placedNodes,
+    edges,
+    updates: updates.length > 0 ? updates : undefined,
+    deletes: deletes.length > 0 ? deletes : undefined,
+    clusters: clusters.length > 0 ? clusters : undefined,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Fallback
+// ---------------------------------------------------------------------------
+
+function buildFallbackPlan(
+  prompt: string,
+  viewport: AgentTurnRequest['context']['viewport'],
+): AIPlan {
+  return {
     nodes: [
       {
         key: 'note',
+        type: 'sticky',
         text: truncate(prompt.trim() || 'Untitled', MAX_NODE_TEXT),
-        role: 'note',
+        x: Math.round(viewport.x + viewport.width / 2),
+        y: Math.round(viewport.y + viewport.height / 2),
       },
     ],
     edges: [],
@@ -373,11 +926,14 @@ interface PlannerResult {
   fallbackFailure?: FailureEnvelope;
 }
 
-async function callPlannerAI(request: AgentTurnRequest, maxNodes: number): Promise<PlannerResult> {
+async function callPlannerAI(
+  request: AgentTurnRequest,
+  maxNodes: number,
+): Promise<PlannerResult> {
   const apiKey = getConfiguredApiKey();
   if (!apiKey) {
     return {
-      plan: buildFallbackPlan(request.prompt),
+      plan: buildFallbackPlan(request.prompt, request.context.viewport),
       fallbackFailure: {
         code: 'provider_error',
         message: 'Gemini API key not configured (set GEMINI_API_KEY). Showing fallback.',
@@ -386,8 +942,9 @@ async function callPlannerAI(request: AgentTurnRequest, maxNodes: number): Promi
     };
   }
 
-  const contextSummary = buildCanvasContextSummary(request);
-  const userContent = `Canvas context: ${contextSummary}\n\nUser request: ${request.prompt}`;
+  const contextShapes = getContextShapeLayouts(request);
+  const contextSummary = buildCanvasContextSummary(request, contextShapes);
+  const userContent = `Canvas context:\n${contextSummary}\n\nUser request: ${request.prompt}`;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), getConfiguredTimeoutMs());
@@ -400,15 +957,13 @@ async function callPlannerAI(request: AgentTurnRequest, maxNodes: number): Promi
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           generationConfig: {
-            temperature: 0.4,
+            temperature: 0.3,
             maxOutputTokens: getConfiguredMaxOutputTokens(),
           },
           systemInstruction: {
-            parts: [{ text: buildSystemPrompt() }],
+            parts: [{ text: buildSystemPrompt(request.context.viewport) }],
           },
-          contents: [
-            { role: 'user', parts: [{ text: userContent }] },
-          ],
+          contents: [{ role: 'user', parts: [{ text: userContent }] }],
         }),
         signal: controller.signal,
       },
@@ -418,10 +973,12 @@ async function callPlannerAI(request: AgentTurnRequest, maxNodes: number): Promi
       let msg = `Gemini HTTP ${response.status}`;
       try {
         const err = (await response.json()) as { error?: { message?: string } };
-        if (typeof err.error?.message === 'string') msg = `Gemini error (${response.status}): ${err.error.message}`;
+        if (typeof err.error?.message === 'string') {
+          msg = `Gemini error (${response.status}): ${err.error.message}`;
+        }
       } catch { /* ignore */ }
       return {
-        plan: buildFallbackPlan(request.prompt),
+        plan: buildFallbackPlan(request.prompt, request.context.viewport),
         fallbackFailure: {
           code: 'provider_error',
           message: `${msg}. Showing fallback.`,
@@ -430,14 +987,14 @@ async function callPlannerAI(request: AgentTurnRequest, maxNodes: number): Promi
       };
     }
 
-    const body = await response.json() as {
+    const body = (await response.json()) as {
       candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
       error?: { code?: number; message?: string };
     };
 
     if (body.error) {
       return {
-        plan: buildFallbackPlan(request.prompt),
+        plan: buildFallbackPlan(request.prompt, request.context.viewport),
         fallbackFailure: {
           code: 'provider_error',
           message: `Gemini provider error: ${body.error.message ?? 'unknown'}. Showing fallback.`,
@@ -456,7 +1013,7 @@ async function callPlannerAI(request: AgentTurnRequest, maxNodes: number): Promi
       parsed = JSON.parse(stripMarkdownFences(rawText));
     } catch {
       return {
-        plan: buildFallbackPlan(request.prompt),
+        plan: buildFallbackPlan(request.prompt, request.context.viewport),
         fallbackFailure: {
           code: 'provider_error',
           message: 'Planner returned non-JSON output. Showing fallback.',
@@ -465,10 +1022,10 @@ async function callPlannerAI(request: AgentTurnRequest, maxNodes: number): Promi
       };
     }
 
-    const plan = sanitizeAndValidatePlan(parsed, maxNodes);
+    const plan = sanitizeAndValidatePlan(parsed, request.context.viewport, maxNodes, contextShapes);
     if (!plan) {
       return {
-        plan: buildFallbackPlan(request.prompt),
+        plan: buildFallbackPlan(request.prompt, request.context.viewport),
         fallbackFailure: {
           code: 'provider_error',
           message: 'Planner returned invalid plan schema. Showing fallback.',
@@ -479,13 +1036,22 @@ async function callPlannerAI(request: AgentTurnRequest, maxNodes: number): Promi
 
     return { plan };
   } catch (error) {
+    const timeoutMs = getConfiguredTimeoutMs();
+    const isTimeoutAbort = error instanceof Error && error.name === 'AbortError';
     const msg = error instanceof Error ? error.message : 'Unknown error';
     return {
-      plan: buildFallbackPlan(request.prompt),
+      plan: buildFallbackPlan(request.prompt, request.context.viewport),
       fallbackFailure: {
         code: 'provider_error',
-        message: `Planner request failed: ${msg}. Showing fallback.`,
+        message: isTimeoutAbort
+          ? `Planner request timed out after ${timeoutMs}ms. Showing fallback.`
+          : `Planner request failed: ${msg}. Showing fallback.`,
         retryable: true,
+        details: isTimeoutAbort
+          ? {
+              timeoutMs,
+            }
+          : undefined,
       },
     };
   } finally {
@@ -494,206 +1060,201 @@ async function callPlannerAI(request: AgentTurnRequest, maxNodes: number): Promi
 }
 
 // ---------------------------------------------------------------------------
-// Layout resolver — the only place coordinates live
-// ---------------------------------------------------------------------------
-
-function clampToViewport(
-  value: number,
-  min: number,
-  max: number,
-): number {
-  return Math.min(max, Math.max(min, value));
-}
-
-function resolvePositions(
-  plan: AIPlan,
-  viewport: AgentTurnRequest['context']['viewport'],
-  turnId: string,
-): ResolvedNode[] {
-  const { x, y, width, height } = viewport;
-  const cx = x + width / 2;
-  const cy = y + height / 2;
-  const safeWidth = width - VIEWPORT_MARGIN * 2;
-  const safeHeight = height - VIEWPORT_MARGIN * 2;
-  const minX = x + VIEWPORT_MARGIN;
-  const minY = y + VIEWPORT_MARGIN;
-
-  const nodes = plan.nodes;
-  const count = nodes.length;
-
-  if (count === 0) return [];
-
-  const positions: Array<{ x: number; y: number }> = [];
-
-  switch (plan.layout) {
-    case 'hub': {
-      // Title at center, others radially around it
-      const titleIndex = nodes.findIndex((n) => n.role === 'title');
-      const others = nodes.map((_, i) => i).filter((i) => i !== titleIndex);
-      const radius = Math.min(safeWidth, safeHeight) * 0.35;
-
-      nodes.forEach((_, i) => {
-        if (i === titleIndex || (titleIndex === -1 && i === 0)) {
-          positions[i] = { x: cx, y: cy };
-        } else {
-          const othersIndex = others.indexOf(i);
-          const angle = (2 * Math.PI * othersIndex) / others.length - Math.PI / 2;
-          positions[i] = {
-            x: clampToViewport(cx + radius * Math.cos(angle), minX, minX + safeWidth),
-            y: clampToViewport(cy + radius * Math.sin(angle), minY, minY + safeHeight),
-          };
-        }
-      });
-      break;
-    }
-
-    case 'linear': {
-      // Nodes flow vertically, centered
-      const stepY = count > 1 ? Math.min(160, safeHeight / (count - 1)) : 0;
-      const totalH = stepY * (count - 1);
-      const startY = cy - totalH / 2;
-
-      nodes.forEach((_, i) => {
-        positions[i] = {
-          x: cx,
-          y: clampToViewport(startY + i * stepY, minY, minY + safeHeight),
-        };
-      });
-      break;
-    }
-
-    case 'grid': {
-      // Auto columns: sqrt(n) rounded, minimum 2
-      const cols = Math.max(2, Math.round(Math.sqrt(count)));
-      const rows = Math.ceil(count / cols);
-      const cellW = Math.min(240, safeWidth / cols);
-      const cellH = Math.min(180, safeHeight / rows);
-      const gridW = cols * cellW;
-      const gridH = rows * cellH;
-      const startX = cx - gridW / 2 + cellW / 2;
-      const startY = cy - gridH / 2 + cellH / 2;
-
-      nodes.forEach((_, i) => {
-        const col = i % cols;
-        const row = Math.floor(i / cols);
-        positions[i] = {
-          x: clampToViewport(startX + col * cellW, minX, minX + safeWidth),
-          y: clampToViewport(startY + row * cellH, minY, minY + safeHeight),
-        };
-      });
-      break;
-    }
-
-    case 'free':
-    default: {
-      // Deterministic spread: golden angle spiral, no overlap
-      const goldenAngle = Math.PI * (3 - Math.sqrt(5));
-      const maxRadius = Math.min(safeWidth, safeHeight) * 0.4;
-
-      nodes.forEach((_, i) => {
-        if (i === 0) {
-          positions[i] = { x: cx, y: cy };
-        } else {
-          const r = maxRadius * Math.sqrt(i / count);
-          const angle = i * goldenAngle;
-          positions[i] = {
-            x: clampToViewport(cx + r * Math.cos(angle), minX, minX + safeWidth),
-            y: clampToViewport(cy + r * Math.sin(angle), minY, minY + safeHeight),
-          };
-        }
-      });
-      break;
-    }
-  }
-
-  return nodes.map((node, i) => ({
-    ...node,
-    x: Math.round(positions[i]!.x),
-    y: Math.round(positions[i]!.y),
-    shapeId: `shape-${turnId}-${node.key}`,
-  }));
-}
-
-// ---------------------------------------------------------------------------
 // Compile plan → tool calls
 // ---------------------------------------------------------------------------
 
 function compilePlanToToolCalls(
   plan: AIPlan,
-  resolvedNodes: ResolvedNode[],
+  turnId: string,
   maxTools: number,
+  viewport: AgentTurnRequest['context']['viewport'],
 ): { toolCalls: ToolCall[]; truncated: boolean } {
-  const keyToShape = new Map<string, ResolvedNode>(resolvedNodes.map((n) => [n.key, n]));
+  // Map node key → deterministic shape ID for edge resolution
+  const keyToShapeId = new Map<string, string>(
+    plan.nodes.map((n) => [n.key, `shape-${turnId}-${normalizeKey(n.key)}`]),
+  );
 
-  // Stickies first, then arrows — stable order
-  const stickyOps: ToolCall[] = resolvedNodes.map((node) => ({
-    toolName: 'place_sticky' as ToolName,
-    arguments: {
-      id: node.shapeId,
-      x: node.x,
-      y: node.y,
-      text: node.text,
-    },
-  }));
+  // ── Create ops ─────────────────────────────────────────────────────────────
+  const createOps: ToolCall[] = plan.nodes.map((node): ToolCall => {
+    const id = keyToShapeId.get(node.key)!;
 
+    if (node.type === 'geo') {
+      return {
+        toolName: 'place_geo' as ToolName,
+        arguments: {
+          id,
+          x: node.x,
+          y: node.y,
+          text: node.text,
+          shape: node.shape ?? 'rectangle',
+          w: node.w ?? DEFAULT_GEO_W,
+          h: node.h ?? DEFAULT_GEO_H,
+          color: node.color ?? 'black',
+        },
+      };
+    }
+
+    if (node.type === 'text') {
+      return {
+        toolName: 'place_text' as ToolName,
+        arguments: {
+          id,
+          x: node.x,
+          y: node.y,
+          text: node.text,
+          color: node.color ?? 'black',
+        },
+      };
+    }
+
+    // default: sticky
+    return {
+      toolName: 'place_sticky' as ToolName,
+      arguments: {
+        id,
+        x: node.x,
+        y: node.y,
+        text: node.text,
+        color: node.color,
+      },
+    };
+  });
+
+  // ── Arrow ops ──────────────────────────────────────────────────────────────
+  // draw_arrow uses fromShapeId/toShapeId (executor's validated field names).
+  // The executor must create the arrow shape THEN call editor.createBindings()
+  // for both terminals so tldraw tracks shape movement automatically.
+  // arrowId gives the executor a deterministic ID to use for createShapeId().
   const arrowOps: ToolCall[] = plan.edges
     .map((edge): ToolCall | null => {
-      const fromShape = keyToShape.get(edge.from);
-      const toShape = keyToShape.get(edge.to);
-      if (!fromShape || !toShape) return null;
+      const fromShapeId = keyToShapeId.get(edge.from);
+      const toShapeId = keyToShapeId.get(edge.to);
+      if (!fromShapeId || !toShapeId) return null;
       return {
         toolName: 'draw_arrow' as ToolName,
         arguments: {
-          fromShapeId: fromShape.shapeId,
-          toShapeId: toShape.shapeId,
+          arrowId: `shape-${turnId}-arrow-${normalizeKey(edge.from)}-${normalizeKey(edge.to)}`,
+          fromShapeId,
+          toShapeId,
+          ...(edge.label !== undefined && { label: edge.label }),
         },
       };
     })
     .filter((op): op is ToolCall => op !== null);
 
-  const allOps = [...stickyOps, ...arrowOps];
+  // ── Group ops ──────────────────────────────────────────────────────────────
+  const clusterOps: ToolCall[] = (plan.clusters ?? [])
+    .map((cluster): ToolCall | null => {
+      const resolvedShapeIds = cluster.shapeIds
+        .map((shapeRef) => {
+          const normalizedRef = normalizeKey(shapeRef);
+          return keyToShapeId.get(shapeRef) ?? keyToShapeId.get(normalizedRef) ?? shapeRef;
+        })
+        .filter((id) => typeof id === 'string' && id.length > 0);
 
-  // Budget: reserve 1 slot for truncation note if needed
-  const budgetForContent = maxTools - 1;
+      const uniqueShapeIds = [...new Set(resolvedShapeIds)];
+      if (uniqueShapeIds.length < 2) return null;
+
+      return {
+        toolName: 'cluster_shapes' as ToolName,
+        arguments: {
+          shapeIds: uniqueShapeIds,
+          label: cluster.label ?? 'Grouped items',
+        },
+      };
+    })
+    .filter((op): op is ToolCall => op !== null);
+
+  // ── Update ops ─────────────────────────────────────────────────────────────
+  const updateOps: ToolCall[] = (plan.updates ?? []).map((u): ToolCall => ({
+    toolName: 'update_shape' as ToolName,
+    arguments: {
+      id: u.id,
+      ...(u.text !== undefined && { text: u.text }),
+      ...(u.x !== undefined && { x: u.x }),
+      ...(u.y !== undefined && { y: u.y }),
+    },
+  }));
+
+  // ── Delete ops ─────────────────────────────────────────────────────────────
+  const deleteOps: ToolCall[] = (plan.deletes ?? []).map((d): ToolCall => ({
+    toolName: 'delete_shape' as ToolName,
+    arguments: { id: d.id },
+  }));
+
+  const allOps = [...createOps, ...arrowOps, ...clusterOps, ...updateOps, ...deleteOps];
+
   if (allOps.length <= maxTools) {
     return { toolCalls: allOps, truncated: false };
   }
 
-  // Truncate: keep as many stickies as fit, skip overflow arrows
-  const truncatedStickies = stickyOps.slice(0, Math.min(stickyOps.length, budgetForContent));
-  const validKeys = new Set(truncatedStickies.map((_, i) => resolvedNodes[i]!.key));
-  const truncatedArrows = arrowOps.filter((op) => {
+  // ── Budget exceeded: truncate gracefully ───────────────────────────────────
+  // Priority: updates > deletes > stickies/geo/text > arrows > warning note
+  const budgetForContent = maxTools - 1; // reserve 1 for the truncation note
+
+  const prioritized = [...updateOps, ...deleteOps, ...createOps];
+  const kept = prioritized.slice(0, budgetForContent);
+
+  const keptCreateIds = new Set(
+    kept
+      .filter((op) => ['place_sticky', 'place_geo', 'place_text'].includes(op.toolName as string))
+      .map((op) => (op.arguments as { id: string }).id),
+  );
+
+  const keptArrows = arrowOps.filter((op) => {
     const args = op.arguments as { fromShapeId: string; toShapeId: string };
-    const fromKey = [...keyToShape.entries()].find(([, n]) => n.shapeId === args.fromShapeId)?.[0];
-    const toKey = [...keyToShape.entries()].find(([, n]) => n.shapeId === args.toShapeId)?.[0];
-    return fromKey && toKey && validKeys.has(fromKey) && validKeys.has(toKey);
+    return keptCreateIds.has(args.fromShapeId) && keptCreateIds.has(args.toShapeId);
   });
 
-  // Find a free position for the truncation note (below last sticky).
-  // ID is turn-specific to avoid collisions across turns.
-  const lastNode = resolvedNodes[truncatedStickies.length - 1];
-  const turnIdSegment = resolvedNodes[0]?.shapeId.split('-')[1] ?? 'unknown';
+  const keptClusters = clusterOps.filter((op) => {
+    const args = op.arguments as { shapeIds: string[] };
+    const shapeIds = Array.isArray(args.shapeIds) ? args.shapeIds : [];
+    if (shapeIds.length < 2) return false;
+
+    const containsCreatedShape = shapeIds.some((id) => keptCreateIds.has(id));
+    if (!containsCreatedShape) {
+      // Keep clusters that target existing canvas shapes.
+      return true;
+    }
+
+    return shapeIds.every((id) => !id.startsWith(`shape-${turnId}-`) || keptCreateIds.has(id));
+  });
+
+  let finalArrows = [...keptArrows];
+  while (kept.length + finalArrows.length >= maxTools && finalArrows.length > 0) {
+    finalArrows = finalArrows.slice(0, -1);
+  }
+
+  let finalClusters = [...keptClusters];
+  while (kept.length + finalArrows.length + finalClusters.length >= maxTools && finalClusters.length > 0) {
+    finalClusters = finalClusters.slice(0, -1);
+  }
+
+  // Truncation note
+  const keptNodes = plan.nodes.filter((n) => keptCreateIds.has(keyToShapeId.get(n.key)!));
+  const noteCandidateX = viewport.x + viewport.width / 2;
+  const noteCandidateY =
+    keptNodes.length > 0
+      ? Math.max(...keptNodes.map((n) => n.y)) + STICKY_H + 30
+      : viewport.y + viewport.height / 2;
+
+  const { hw: nHw, hh: nHh } = { hw: STICKY_W / 2, hh: STICKY_H / 2 };
+  const minX = viewport.x + nHw + 20;
+  const maxX = viewport.x + viewport.width - nHw - 20;
+  const minY = viewport.y + nHh + 20;
+  const maxY = viewport.y + viewport.height - nHh - 20;
+
   const truncationNote: ToolCall = {
     toolName: 'place_sticky' as ToolName,
     arguments: {
-      id: `shape-${turnIdSegment}-truncated`,
-      x: lastNode ? lastNode.x : 0,
-      y: lastNode ? lastNode.y + 120 : 0,
-      text: `⚠️ Truncated: showing ${truncatedStickies.length} of ${stickyOps.length} items (tool limit reached).`,
+      id: `shape-${turnId}-truncated`,
+      x: clamp(noteCandidateX, minX, maxX),
+      y: clamp(noteCandidateY, minY, maxY),
+      text: `⚠️ Truncated: showing ${kept.filter(o => ['place_sticky','place_geo','place_text'].includes(o.toolName as string)).length} of ${plan.nodes.length} shapes.`,
     },
   };
 
-  // Always guarantee the truncation note appears.
-  // Drop trailing arrows until there is room for it.
-  let arrows = [...truncatedArrows];
-  while (truncatedStickies.length + arrows.length >= maxTools && arrows.length > 0) {
-    arrows = arrows.slice(0, -1);
-  }
-
-  return {
-    toolCalls: [...truncatedStickies, ...arrows, truncationNote],
-    truncated: true,
-  };
+  return { toolCalls: [...kept, ...finalArrows, ...finalClusters, truncationNote], truncated: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -710,9 +1271,6 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
   ];
 
   const maxToolsPerTurn = getConfiguredMaxToolsPerTurn();
-
-  // Give AI the full node budget; truncation in compilePlanToToolCalls handles overflow.
-  // Reserve 1 slot minimum for at least one arrow or the truncation note itself.
   const maxNodes = Math.min(MAX_NODES_HARD, Math.max(1, maxToolsPerTurn - 1));
 
   // --- 1. Get plan from AI ---
@@ -727,9 +1285,8 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
     });
   }
 
-  // --- 2. Conversational mode: message only, no canvas mutations ---
+  // --- 2. Conversational mode ---
   if (plan.message && plan.nodes.length === 0) {
-    // Stream message as delta
     const chunkSize = 40;
     for (let i = 0; i < plan.message.length; i += chunkSize) {
       events.push({
@@ -739,13 +1296,11 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
         delta: plan.message.slice(i, i + chunkSize),
       });
     }
-
     events.push({
       type: 'agent.stream.completed',
       turnId: request.turnId,
       at: new Date().toISOString(),
     });
-
     return {
       turnId: request.turnId,
       accepted: true,
@@ -755,12 +1310,13 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
     };
   }
 
-  // --- 3. Infer missing edges for hub/linear, then resolve positions ---
-  const enrichedPlan: AIPlan = { ...plan, edges: inferEdges(plan) };
-  const resolvedNodes = resolvePositions(enrichedPlan, request.context.viewport, request.turnId);
-
-  // --- 4. Compile to tool calls ---
-  const { toolCalls, truncated } = compilePlanToToolCalls(enrichedPlan, resolvedNodes, maxToolsPerTurn);
+  // --- 3. Compile to tool calls ---
+  const { toolCalls, truncated } = compilePlanToToolCalls(
+    plan,
+    request.turnId,
+    maxToolsPerTurn,
+    request.context.viewport,
+  );
 
   if (truncated) {
     events.push({
@@ -771,7 +1327,7 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
     });
   }
 
-  // --- 5. Execute tool calls with streaming events ---
+  // --- 4. Execute tool calls with streaming events ---
   const actions: CanvasActionEnvelope[] = [];
 
   for (const entry of toolCalls) {
@@ -779,7 +1335,6 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
     const serializedArguments = JSON.stringify(entry.arguments);
     const chunkSize = Math.max(8, Math.floor(serializedArguments.length / 2));
 
-    // Stream argument deltas
     let argumentBuffer = '';
     for (let index = 0; index < serializedArguments.length; index += chunkSize) {
       const fragment = serializedArguments.slice(index, index + chunkSize);
@@ -798,7 +1353,6 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
       });
     }
 
-    // Parse accumulated buffer
     let parsedArguments: Record<string, unknown>;
     try {
       const p = JSON.parse(argumentBuffer);
@@ -823,7 +1377,6 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
       toolCall: validatedEnvelope,
     });
 
-    // Execute
     try {
       const action = executeToolCall(request.roomId, validatedEnvelope);
       actions.push(action);
@@ -870,3 +1423,65 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
     error: fallbackFailure?.message,
   };
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REQUIRED toolExecutor.ts changes — implement these handlers:
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// 1. place_sticky (existing — keep as-is)
+//    args: { id, x, y, text, color? }
+//    → editor.createShape({ id: createShapeId(id), type: 'note',
+//        x: x - STICKY_W/2, y: y - STICKY_H/2,
+//        props: { richText: toRichText(text), color: color ?? 'yellow' } })
+//
+// 2. place_geo (NEW)
+//    args: { id, x, y, text, shape, w, h, color }
+//    → editor.createShape({ id: createShapeId(id), type: 'geo',
+//        x: x - w/2, y: y - h/2,
+//        props: { geo: shape, w, h, richText: toRichText(text),
+//                 color, fill: 'solid', dash: 'draw', size: 'm' } })
+//
+// 3. place_text (NEW)
+//    args: { id, x, y, text, color }
+//    → editor.createShape({ id: createShapeId(id), type: 'text',
+//        x, y,
+//        props: { richText: toRichText(text), color, size: 'xl', font: 'draw',
+//                 autoSize: true } })
+//
+// 4. draw_arrow (UPDATED — use bindings, not free coordinates)
+//    args: { id, startShapeId, endShapeId, label? }
+//    → const arrowId = createShapeId(id)
+//      editor.createShape({ id: arrowId, type: 'arrow',
+//        x: 0, y: 0,
+//        props: { start: { x: 0, y: 0 }, end: { x: 0, y: 0 },
+//                 arrowheadEnd: 'arrow', arrowheadStart: 'none',
+//                 ...(label ? { richText: toRichText(label) } : {}) } })
+//      editor.createBindings([
+//        { fromId: arrowId, toId: startShapeId, type: 'arrow',
+//          props: { terminal: 'start', normalizedAnchor: { x: 0.5, y: 0.5 },
+//                   isPrecise: false, isExact: false } },
+//        { fromId: arrowId, toId: endShapeId, type: 'arrow',
+//          props: { terminal: 'end', normalizedAnchor: { x: 0.5, y: 0.5 },
+//                   isPrecise: false, isExact: false } },
+//      ])
+//
+// 5. update_shape (NEW)
+//    args: { id, text?, x?, y? }
+//    → const shape = editor.getShape(id as TLShapeId)
+//      if (!shape) return
+//      const patch: TLShapePartial = { id: shape.id, type: shape.type }
+//      if (text) patch.props = { richText: toRichText(text) }
+//      if (x !== undefined || y !== undefined) {
+//        const bounds = editor.getShapePageBounds(shape.id)
+//        patch.x = (x ?? shape.x + (bounds?.w ?? 0) / 2) - (bounds?.w ?? 0) / 2
+//        patch.y = (y ?? shape.y + (bounds?.h ?? 0) / 2) - (bounds?.h ?? 0) / 2
+//      }
+//      editor.updateShapes([patch])
+//
+// 6. delete_shape (NEW)
+//    args: { id }
+//    → editor.deleteShapes([id as TLShapeId])
+//
+// Also add the new ToolName values to contracts.ts:
+//   'place_geo' | 'place_text' | 'update_shape' | 'delete_shape'
+// ═══════════════════════════════════════════════════════════════════════════════

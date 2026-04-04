@@ -10,12 +10,35 @@ const BASE_TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'place_sticky',
     description: 'Create a note-like shape in the current room.',
-    requiredKeys: ['x', 'y', 'text'],
+    requiredKeys: ['id', 'x', 'y', 'text'],
+  },
+  {
+    name: 'place_geo',
+    description: 'Create a geometric shape with text in the current room.',
+    // Added w, h, and color to align with handlePlaceGeo
+    requiredKeys: ['id', 'x', 'y', 'text', 'shape', 'w', 'h', 'color'], 
+  },
+  {
+    name: 'place_text',
+    description: 'Create a text label in the current room.',
+    // Added color to align with handlePlaceText
+    requiredKeys: ['id', 'x', 'y', 'text', 'color'], 
   },
   {
     name: 'draw_arrow',
     description: 'Connect two shapes with an arrow.',
-    requiredKeys: ['fromShapeId', 'toShapeId'],
+    // Explicitly define the required arrow arguments from the patch
+    requiredKeys: ['arrowId', 'fromShapeId', 'toShapeId'], 
+  },
+  {
+    name: 'update_shape',
+    description: 'Update shape text and/or position by id.',
+    requiredKeys: ['id'],
+  },
+  {
+    name: 'delete_shape',
+    description: 'Delete a shape by id.',
+    requiredKeys: ['id'],
   },
   {
     name: 'cluster_shapes',
@@ -63,6 +86,7 @@ export function isKnownToolName(name: string): name is ToolName {
 
 export function validateToolArguments(toolName: ToolName, arguments_: Record<string, unknown>) {
   const schema = getToolSchemas().find((tool) => tool.name === toolName);
+  
   if (!schema) {
     return {
       valid: false,
@@ -71,9 +95,28 @@ export function validateToolArguments(toolName: ToolName, arguments_: Record<str
   }
 
   const missingKeys = schema.requiredKeys.filter((key) => !(key in arguments_));
+  
+  if (missingKeys.length > 0) {
+    return {
+      valid: false,
+      missingKeys,
+    };
+  }
+
+  // update_shape requires at least one property to actually update
+  if (toolName === 'update_shape') {
+    const hasUpdate = 'text' in arguments_ || 'x' in arguments_ || 'y' in arguments_;
+    if (!hasUpdate) {
+      return {
+        valid: false,
+        missingKeys: ['text|x|y'],
+      };
+    }
+  }
+
   return {
-    valid: missingKeys.length === 0,
-    missingKeys,
+    valid: true,
+    missingKeys: [],
   };
 }
 

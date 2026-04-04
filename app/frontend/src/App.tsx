@@ -28,6 +28,10 @@ export const defaultRoomId = 'demo-room';
 export const defaultSessionId = 'demo-session';
 const maxCreateOperationsPerAgentTurn = 50;
 const maxAppliedRemoteActionIds = 2_000;
+const DEFAULT_NOTE_W = 200;
+const DEFAULT_NOTE_H = 120;
+const DEFAULT_GEO_W = 160;
+const DEFAULT_GEO_H = 80;
 
 export interface AppOptions {
   roomId?: string;
@@ -43,6 +47,17 @@ export interface MountedApp {
 
 function createId(prefix: string): string {
   return `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function toShapeId(value: unknown, fallbackPrefix: string): string {
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const raw = value.trim();
+    if (raw.startsWith('shape:')) {
+      return raw;
+    }
+    return `shape:${raw.replace(/[^a-zA-Z0-9:_-]/g, '-')}`;
+  }
+  return `shape:${fallbackPrefix}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function parseRoomAndSessionFromUrl(): { roomId: string; sessionId: string } {
@@ -85,6 +100,104 @@ function isShapeRecord(record: unknown): record is TLShape {
 function isTextualShape(shape: TLShape): boolean {
   const typedShape = shape as TLShape & { type?: string; props?: { text?: unknown } };
   return (typedShape.type === 'text' || typedShape.type === 'note') && typeof typedShape.props?.text === 'string';
+}
+
+type RichTextNode = {
+  type: 'text';
+  text: string;
+};
+
+type RichTextParagraph = {
+  type: 'paragraph';
+  content?: RichTextNode[];
+};
+
+type RichTextDocument = {
+  type: 'doc';
+  content: RichTextParagraph[];
+};
+
+function toRichText(text: string): RichTextDocument {
+  const trimmed = text.trim();
+  return {
+    type: 'doc',
+    content: [
+      {
+        type: 'paragraph',
+        content: trimmed.length > 0 ? [{ type: 'text', text }] : undefined,
+      },
+    ],
+  };
+}
+
+function extractRichText(richText: unknown): string {
+  if (typeof richText !== 'object' || richText === null) {
+    return '';
+  }
+
+  const root = richText as Record<string, unknown>;
+  const doc = root.doc ?? root;
+
+  const walk = (node: unknown): string => {
+    if (typeof node !== 'object' || node === null) return '';
+    const record = node as Record<string, unknown>;
+    if (typeof record.text === 'string') return record.text;
+    if (!Array.isArray(record.content)) return '';
+    return record.content.map(walk).join('');
+  };
+
+  return walk(doc).replace(/\s+/g, ' ').trim();
+}
+
+function estimateTextBounds(text: string): { w: number; h: number } {
+  const normalized = text.trim();
+  if (normalized.length === 0) {
+    return { w: 80, h: 28 };
+  }
+
+  const lines = normalized.split(/\r?\n/);
+  const maxChars = lines.reduce((max, line) => Math.max(max, line.length), 1);
+  // Rough fit for default tldraw text at size "xl".
+  const estimatedWidth = Math.min(1200, Math.max(40, Math.round(maxChars * 11)));
+  const estimatedHeight = Math.max(28, Math.round(lines.length * 28));
+  return { w: estimatedWidth, h: estimatedHeight };
+}
+
+function getShapeDimensionsForCentering(editor: Editor, shape: TLShape): { w: number; h: number } {
+  const bounds = getEditorShapePageBounds(editor, shape.id);
+  if (bounds && bounds.w > 0 && bounds.h > 0) {
+    return { w: bounds.w, h: bounds.h };
+  }
+
+  const typed = shape as TLShape & {
+    type?: string;
+    props?: Record<string, unknown> & { w?: unknown; h?: unknown; richText?: unknown; text?: unknown };
+  };
+
+  if (typed.type === 'note') {
+    return { w: DEFAULT_NOTE_W, h: DEFAULT_NOTE_H };
+  }
+
+  if (typed.type === 'geo') {
+    const w = typeof typed.props?.w === 'number' && typed.props.w > 0 ? typed.props.w : DEFAULT_GEO_W;
+    const h = typeof typed.props?.h === 'number' && typed.props.h > 0 ? typed.props.h : DEFAULT_GEO_H;
+    return { w, h };
+  }
+
+  if (typed.type === 'text') {
+    const richText = typed.props?.richText;
+    const plainText =
+      typeof typed.props?.text === 'string'
+        ? typed.props.text
+        : richText !== undefined
+          ? extractRichText(richText)
+          : '';
+    return estimateTextBounds(plainText);
+  }
+
+  const w = typeof typed.props?.w === 'number' && typed.props.w > 0 ? typed.props.w : 160;
+  const h = typeof typed.props?.h === 'number' && typed.props.h > 0 ? typed.props.h : 100;
+  return { w, h };
 }
 
 function createShapeAction(
@@ -142,7 +255,52 @@ function getViewport(editor: Editor) {
   };
 }
 
-function toShapeSnapshot(shape: TLShape): CanvasShapeSnapshot {
+type PageBounds = { x: number; y: number; w: number; h: number };
+
+function getEditorShape(editor: Editor, shapeId: string): TLShape | undefined {
+  const maybe = editor as unknown as {
+    getShape?: (id: string) => TLShape | undefined;
+  };
+  return maybe.getShape?.(shapeId);
+}
+
+function getEditorShapePageBounds(editor: Editor, shapeId: string): PageBounds | undefined {
+  const maybe = editor as unknown as {
+    getShapePageBounds?: (id: string) => { x: number; y: number; w: number; h: number } | undefined;
+  };
+  return maybe.getShapePageBounds?.(shapeId);
+}
+
+function getEditorShapesPageBounds(editor: Editor, shapeIds: string[]): PageBounds | undefined {
+  const maybe = editor as unknown as {
+    getShapesPageBounds?: (ids: string[]) => { x: number; y: number; w: number; h: number } | null | undefined;
+  };
+  const bounds = maybe.getShapesPageBounds?.(shapeIds);
+  return bounds ?? undefined;
+}
+
+function updateEditorShapes(editor: Editor, updates: Array<Record<string, unknown>>) {
+  const maybe = editor as unknown as {
+    updateShapes?: (partials: unknown[]) => void;
+  };
+  maybe.updateShapes?.(updates);
+}
+
+function createEditorBindings(editor: Editor, bindings: unknown[]) {
+  const maybe = editor as unknown as {
+    createBindings?: (partials: unknown[]) => void;
+  };
+  maybe.createBindings?.(bindings);
+}
+
+function groupEditorShapes(editor: Editor, shapeIds: string[], options?: { groupId?: string; select?: boolean }) {
+  const maybe = editor as unknown as {
+    groupShapes?: (ids: string[], opts?: { groupId?: string; select?: boolean }) => void;
+  };
+  maybe.groupShapes?.(shapeIds, options);
+}
+
+function toShapeSnapshot(editor: Editor, shape: TLShape): CanvasShapeSnapshot {
   const typedShape = shape as TLShape & {
     type?: string;
     props?: Record<string, unknown> & { text?: unknown; w?: unknown; h?: unknown };
@@ -151,8 +309,15 @@ function toShapeSnapshot(shape: TLShape): CanvasShapeSnapshot {
     meta?: { clusterId?: unknown; memberShapeIds?: unknown };
   };
 
-  const width = typeof typedShape.props?.w === 'number' ? typedShape.props.w : 180;
-  const height = typeof typedShape.props?.h === 'number' ? typedShape.props.h : 120;
+  const pageBounds = getEditorShapePageBounds(editor, shape.id);
+  const width = pageBounds?.w ?? (typeof typedShape.props?.w === 'number' ? typedShape.props.w : 180);
+  const height = pageBounds?.h ?? (typeof typedShape.props?.h === 'number' ? typedShape.props.h : 120);
+  const textFromProps =
+    typeof typedShape.props?.text === 'string'
+      ? typedShape.props.text
+      : typedShape.props?.richText !== undefined
+        ? extractRichText(typedShape.props.richText)
+        : undefined;
   const kind: CanvasShapeSnapshot['kind'] =
     typedShape.type === 'text'
       ? 'text'
@@ -171,13 +336,13 @@ function toShapeSnapshot(shape: TLShape): CanvasShapeSnapshot {
     kind,
     type: typeof typedShape.type === 'string' ? typedShape.type : undefined,
     bounds: {
-      x: typeof typedShape.x === 'number' ? typedShape.x : 0,
-      y: typeof typedShape.y === 'number' ? typedShape.y : 0,
+      x: pageBounds?.x ?? (typeof typedShape.x === 'number' ? typedShape.x : 0),
+      y: pageBounds?.y ?? (typeof typedShape.y === 'number' ? typedShape.y : 0),
       width,
       height,
     },
     updatedAt: new Date().toISOString(),
-    text: typeof typedShape.props?.text === 'string' ? typedShape.props.text : undefined,
+    text: textFromProps,
     props: typeof typedShape.props === 'object' && typedShape.props !== null ? typedShape.props : undefined,
     clusterId:
       typeof typedShape.meta?.clusterId === 'string'
@@ -549,7 +714,8 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
   };
 
   const applyRemote = (action: CanvasActionEnvelope) => {
-    if (!editor) {
+    const activeEditor = editor;
+    if (!activeEditor) {
       return;
     }
     if (appliedRemoteActionIds.has(action.id)) {
@@ -565,6 +731,11 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
     }
 
     const plan = applyCanvasAction(action);
+    if (action.source === 'agent' && plan.operations.length === 0) {
+      setAgentUiState(false, 'Ready', 'Agent produced an unsupported or empty mutation.');
+      return;
+    }
+
     const createOperationCount = plan.operations.filter((operation) => operation.kind === 'create').length;
     if (action.source === 'agent' && createOperationCount > maxCreateOperationsPerAgentTurn) {
       setAgentUiState(
@@ -577,31 +748,140 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
 
     applyingRemoteAction = true;
     try {
-      editor.run(() => {
+      activeEditor.run(() => {
         for (const operation of plan.operations) {
           if (operation.kind === 'create') {
             const shapeInput = operation.payload.shapeInput;
             if (shapeInput && typeof shapeInput === 'object') {
-              editor?.createShapes([shapeInput as never]);
+              activeEditor.createShapes([shapeInput as never]);
+
+              const center =
+                typeof operation.payload.center === 'object' && operation.payload.center !== null
+                  ? (operation.payload.center as Record<string, unknown>)
+                  : null;
+              const centerX =
+                center && typeof center.x === 'number' && Number.isFinite(center.x) ? center.x : undefined;
+              const centerY =
+                center && typeof center.y === 'number' && Number.isFinite(center.y) ? center.y : undefined;
+
+              if (centerX !== undefined && centerY !== undefined && operation.targetIds.length > 0) {
+                const createRecord = shapeInput as Record<string, unknown>;
+                const maybeProps =
+                  typeof createRecord.props === 'object' && createRecord.props !== null
+                    ? (createRecord.props as Record<string, unknown>)
+                    : null;
+                const richText = maybeProps?.richText;
+                const estimated = estimateTextBounds(extractRichText(richText));
+
+                const centerUpdates: Array<Record<string, unknown>> = [];
+                for (const shapeId of operation.targetIds) {
+                  const createdShape = getEditorShape(activeEditor, shapeId);
+                  if (!createdShape) {
+                    continue;
+                  }
+
+                  const measuredBounds = getEditorShapePageBounds(activeEditor, shapeId);
+                  const width = measuredBounds?.w ?? estimated.w;
+                  const height = measuredBounds?.h ?? estimated.h;
+
+                  centerUpdates.push({
+                    id: createdShape.id,
+                    type: createdShape.type,
+                    x: centerX - width / 2,
+                    y: centerY - height / 2,
+                  });
+                }
+
+                if (centerUpdates.length > 0) {
+                  updateEditorShapes(activeEditor, centerUpdates);
+                }
+              }
+
+              const bindings = operation.payload.bindings;
+              if (Array.isArray(bindings) && bindings.length > 0) {
+                const validBindings = bindings.filter((binding) => {
+                  if (typeof binding !== 'object' || binding === null) return false;
+                  const record = binding as Record<string, unknown>;
+                  const fromId = typeof record.fromId === 'string' ? record.fromId : '';
+                  const toId = typeof record.toId === 'string' ? record.toId : '';
+                  const type = typeof record.type === 'string' ? record.type : '';
+                  return (
+                    type.length > 0 &&
+                    fromId.length > 0 &&
+                    toId.length > 0 &&
+                    getEditorShape(activeEditor, fromId) !== undefined &&
+                    getEditorShape(activeEditor, toId) !== undefined
+                  );
+                });
+                if (validBindings.length > 0) {
+                  createEditorBindings(activeEditor, validBindings);
+                }
+              }
               continue;
             }
 
             const shape = operation.payload.shape;
             if (isShapeRecord(shape)) {
-              editor?.store.put([shape]);
+              activeEditor.store.put([shape]);
             }
             continue;
           }
           if (operation.kind === 'update') {
             const shapeInput = operation.payload.shapeInput;
             if (shapeInput && typeof shapeInput === 'object') {
-              editor?.createShapes([shapeInput as never]);
+              activeEditor.createShapes([shapeInput as never]);
+              continue;
+            }
+
+            const shapePatch =
+              typeof operation.payload.shapePatch === 'object' && operation.payload.shapePatch !== null
+                ? (operation.payload.shapePatch as Record<string, unknown>)
+                : null;
+            if (shapePatch && operation.targetIds.length > 0) {
+              const updates: Array<Record<string, unknown>> = [];
+              const textPatch = typeof shapePatch.text === 'string' ? shapePatch.text : undefined;
+              const xPatch = typeof shapePatch.x === 'number' && Number.isFinite(shapePatch.x) ? shapePatch.x : undefined;
+              const yPatch = typeof shapePatch.y === 'number' && Number.isFinite(shapePatch.y) ? shapePatch.y : undefined;
+
+              for (const shapeId of operation.targetIds) {
+                const existing = getEditorShape(activeEditor, shapeId);
+                if (!existing) {
+                  continue;
+                }
+
+                const patch: Record<string, unknown> = {
+                  id: existing.id,
+                  type: existing.type,
+                };
+
+                if (textPatch !== undefined) {
+                  patch.props = {
+                    richText: toRichText(textPatch),
+                  };
+                }
+
+                if (xPatch !== undefined || yPatch !== undefined) {
+                  const { w: width, h: height } = getShapeDimensionsForCentering(activeEditor, existing);
+                  const currentCenterX = (typeof existing.x === 'number' ? existing.x : 0) + width / 2;
+                  const currentCenterY = (typeof existing.y === 'number' ? existing.y : 0) + height / 2;
+                  const nextCenterX = xPatch ?? currentCenterX;
+                  const nextCenterY = yPatch ?? currentCenterY;
+                  patch.x = nextCenterX - width / 2;
+                  patch.y = nextCenterY - height / 2;
+                }
+
+                updates.push(patch);
+              }
+
+              if (updates.length > 0) {
+                updateEditorShapes(activeEditor, updates);
+              }
               continue;
             }
 
             const metaPatch = operation.payload.metaPatch;
             if (metaPatch && typeof metaPatch === 'object' && operation.targetIds.length > 0) {
-              const maybeStore = editor?.store as unknown as {
+              const maybeStore = activeEditor.store as unknown as {
                 get?: (id: string) => unknown;
               };
               const nextShapes: TLShape[] = [];
@@ -620,19 +900,67 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
                 nextShapes.push(withMeta);
               }
               if (nextShapes.length > 0) {
-                editor?.store.put(nextShapes);
+                activeEditor.store.put(nextShapes);
               }
               continue;
             }
 
             const shape = operation.payload.shape;
             if (isShapeRecord(shape)) {
-              editor?.store.put([shape]);
+              activeEditor.store.put([shape]);
             }
             continue;
           }
           if (operation.kind === 'delete') {
-            editor?.deleteShapes(operation.targetIds);
+            activeEditor.deleteShapes(operation.targetIds);
+            continue;
+          }
+
+          if (operation.kind === 'batch') {
+            const groupShapeIds = Array.isArray(operation.payload.groupShapeIds)
+              ? (operation.payload.groupShapeIds as unknown[])
+                  .filter((id): id is string => typeof id === 'string')
+                  .map((id) => toShapeId(id, 'group-target'))
+              : [];
+            const validGroupShapeIds = [...new Set(groupShapeIds)].filter((id) => getEditorShape(activeEditor, id) !== undefined);
+
+            if (validGroupShapeIds.length >= 2) {
+              const groupId =
+                typeof operation.payload.groupId === 'string' && operation.payload.groupId.trim().length > 0
+                  ? toShapeId(operation.payload.groupId, 'agent-group')
+                  : undefined;
+
+              if (groupId) {
+                groupEditorShapes(activeEditor, validGroupShapeIds, { groupId, select: false });
+              } else {
+                groupEditorShapes(activeEditor, validGroupShapeIds, { select: false });
+              }
+
+              const label =
+                typeof operation.payload.label === 'string' && operation.payload.label.trim().length > 0
+                  ? operation.payload.label.trim()
+                  : '';
+              if (label.length > 0) {
+                const bounds = getEditorShapesPageBounds(activeEditor, validGroupShapeIds);
+                if (bounds) {
+                  activeEditor.createShapes([
+                    {
+                      id: toShapeId(undefined, 'group-label'),
+                      type: 'text',
+                      x: bounds.x + bounds.w / 2,
+                      y: bounds.y - 36,
+                      props: {
+                        richText: toRichText(label),
+                        color: 'grey',
+                        size: 's',
+                        font: 'draw',
+                        autoSize: true,
+                      },
+                    } as never,
+                  ]);
+                }
+              }
+            }
           }
         }
       });
@@ -679,9 +1007,14 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
     lastTriggerSignature = signature;
     lastTriggerAt = now;
 
-    const viewport = getViewport(editor);
-    const snapshot = collectShapesFromSnapshot(getCurrentShapeSnapshot(editor));
-    const shapeSnapshots = snapshot.map((shape) => toShapeSnapshot(shape));
+    const activeEditor = editor;
+    if (!activeEditor) {
+      return;
+    }
+
+    const viewport = getViewport(activeEditor);
+    const snapshot = collectShapesFromSnapshot(getCurrentShapeSnapshot(activeEditor));
+    const shapeSnapshots = snapshot.map((shape) => toShapeSnapshot(activeEditor, shape));
     const context = buildAgentContext(
       {
         roomId,

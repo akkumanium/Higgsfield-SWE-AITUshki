@@ -5,7 +5,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "smoke": "npm run build ; node dist/run-demo-smoke.js"
+    "smoke": "npm run build && node dist/run-demo-smoke.js"
   },
   "dependencies": {
     "@ai-canvas/shared": "workspace:*"

@@ -43,8 +43,22 @@ export interface CanvasMutationPlan {
   operations: CanvasMutationOperation[];
 }
 
+const STICKY_W = 200;
+const STICKY_H = 120;
+
 function createOperationId(prefix: string): string {
   return `shape:${prefix}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function toShapeId(value: unknown, fallbackPrefix: string): string {
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const raw = value.trim();
+    if (raw.startsWith('shape:')) {
+      return raw;
+    }
+    return `shape:${raw.replace(/[^a-zA-Z0-9:_-]/g, '-')}`;
+  }
+  return createOperationId(fallbackPrefix);
 }
 
 function toNumber(value: unknown, fallback: number): number {
@@ -67,6 +81,11 @@ function toStringArray(value: unknown): string[] {
   return value.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0);
 }
 
+function toUniqueShapeIds(value: unknown): string[] {
+  const ids = toStringArray(value).map((id) => toShapeId(id, 'shape-ref'));
+  return [...new Set(ids)];
+}
+
 function mapToolPayloadToOperations(action: CanvasActionEnvelope): CanvasMutationOperation[] {
   const toolName = typeof action.payload.toolName === 'string' ? action.payload.toolName : '';
   const arguments_ =
@@ -76,7 +95,10 @@ function mapToolPayloadToOperations(action: CanvasActionEnvelope): CanvasMutatio
 
   if (toolName === 'place_sticky') {
     const text = toStringValue(arguments_.text, 'New note');
-    const id = createOperationId('agent-sticky');
+    const id = toShapeId(arguments_.id, 'agent-sticky');
+    const centerX = clampNumber(arguments_.x, -5000, 5000, 240);
+    const centerY = clampNumber(arguments_.y, -5000, 5000, 180);
+    const color = toStringValue(arguments_.color, 'yellow');
     return [
       {
         kind: 'create',
@@ -85,15 +107,90 @@ function mapToolPayloadToOperations(action: CanvasActionEnvelope): CanvasMutatio
           shapeInput: {
             id,
             type: 'note',
-            x: clampNumber(arguments_.x, -5000, 5000, 240),
-            y: clampNumber(arguments_.y, -5000, 5000, 180),
+            x: centerX - STICKY_W / 2,
+            y: centerY - STICKY_H / 2,
             props: {
               richText: toRichText(text),
+              color,
             },
             meta: {
               agentText: text,
             },
           },
+        },
+      },
+    ];
+  }
+
+  if (toolName === 'place_geo') {
+    const text = toStringValue(arguments_.text, 'New shape');
+    const id = toShapeId(arguments_.id, 'agent-geo');
+    const w = clampNumber(arguments_.w, 40, 1200, 160);
+    const h = clampNumber(arguments_.h, 30, 1200, 80);
+    const centerX = clampNumber(arguments_.x, -5000, 5000, 240);
+    const centerY = clampNumber(arguments_.y, -5000, 5000, 180);
+    const shape = toStringValue(arguments_.shape, 'rectangle');
+    const color = toStringValue(arguments_.color, 'black');
+
+    return [
+      {
+        kind: 'create',
+        targetIds: [id],
+        payload: {
+          shapeInput: {
+            id,
+            type: 'geo',
+            x: centerX - w / 2,
+            y: centerY - h / 2,
+            props: {
+              geo: shape,
+              w,
+              h,
+              richText: toRichText(text),
+              color,
+              fill: 'solid',
+              dash: 'draw',
+              size: 'm',
+            },
+            meta: {
+              agentText: text,
+            },
+          },
+        },
+      },
+    ];
+  }
+
+  if (toolName === 'place_text') {
+    const text = toStringValue(arguments_.text, 'Text');
+    const id = toShapeId(arguments_.id, 'agent-text');
+    const color = toStringValue(arguments_.color, 'black');
+    const centerX = clampNumber(arguments_.x, -5000, 5000, 240);
+    const centerY = clampNumber(arguments_.y, -5000, 5000, 180);
+    return [
+      {
+        kind: 'create',
+        targetIds: [id],
+        payload: {
+          shapeInput: {
+            id,
+            type: 'text',
+            // For text shapes we receive center coordinates from the planner.
+            // Create first, then recenter in App.tsx using measured bounds.
+            x: centerX,
+            y: centerY,
+            props: {
+              richText: toRichText(text),
+              color,
+              size: 'xl',
+              font: 'draw',
+              autoSize: true,
+            },
+            meta: {
+              agentText: text,
+            },
+          },
+          center: { x: centerX, y: centerY },
         },
       },
     ];
@@ -139,11 +236,10 @@ function mapToolPayloadToOperations(action: CanvasActionEnvelope): CanvasMutatio
   }
 
   if (toolName === 'draw_arrow') {
-    const fromShapeId = toStringValue(arguments_.fromShapeId, 'unknown-from');
-    const toShapeId = toStringValue(arguments_.toShapeId, 'unknown-to');
-    const providedX = toNumber(arguments_.x, Number.NaN);
-    const providedY = toNumber(arguments_.y, Number.NaN);
-    const id = createOperationId('agent-arrow');
+    const fromShapeId = toShapeId(arguments_.fromShapeId, 'unknown-from');
+    const toShapeIdValue = toShapeId(arguments_.toShapeId, 'unknown-to');
+    const id = toShapeId(arguments_.arrowId ?? arguments_.id, 'agent-arrow');
+    const label = typeof arguments_.label === 'string' ? arguments_.label.trim() : '';
     return [
       {
         kind: 'create',
@@ -152,69 +248,105 @@ function mapToolPayloadToOperations(action: CanvasActionEnvelope): CanvasMutatio
           shapeInput: {
             id,
             type: 'arrow',
-            x: Number.isFinite(providedX) ? clampNumber(providedX, -5000, 5000, 280) : 280,
-            y: Number.isFinite(providedY) ? clampNumber(providedY, -5000, 5000, 220) : 220,
+            x: 0,
+            y: 0,
             props: {
-              end: {
-                x: 180,
-                y: 0,
+              start: { x: 0, y: 0 },
+              end: { x: 0, y: 0 },
+              arrowheadEnd: 'arrow',
+              arrowheadStart: 'none',
+              ...(label.length > 0 ? { richText: toRichText(label) } : {}),
+            },
+          },
+          bindings: [
+            {
+              fromId: id,
+              toId: fromShapeId,
+              type: 'arrow',
+              props: {
+                terminal: 'start',
+                normalizedAnchor: { x: 0.5, y: 0.5 },
+                isPrecise: false,
+                isExact: false,
+                snap: 'none',
               },
             },
-            meta: {
-              fromShapeId,
-              toShapeId,
+            {
+              fromId: id,
+              toId: toShapeIdValue,
+              type: 'arrow',
+              props: {
+                terminal: 'end',
+                normalizedAnchor: { x: 0.5, y: 0.5 },
+                isPrecise: false,
+                isExact: false,
+                snap: 'none',
+              },
             },
+          ],
+        },
+      },
+    ];
+  }
+
+  if (toolName === 'update_shape') {
+    const id = toShapeId(arguments_.id, 'update-target');
+    const text = typeof arguments_.text === 'string' ? arguments_.text : undefined;
+    const x = typeof arguments_.x === 'number' && Number.isFinite(arguments_.x) ? arguments_.x : undefined;
+    const y = typeof arguments_.y === 'number' && Number.isFinite(arguments_.y) ? arguments_.y : undefined;
+
+    if (text === undefined && x === undefined && y === undefined) {
+      return [];
+    }
+
+    return [
+      {
+        kind: 'update',
+        targetIds: [id],
+        payload: {
+          shapePatch: {
+            ...(text !== undefined ? { text } : {}),
+            ...(x !== undefined ? { x } : {}),
+            ...(y !== undefined ? { y } : {}),
           },
         },
       },
     ];
   }
 
-  if (toolName === 'cluster_shapes') {
-    const shapeIds = toStringArray(arguments_.shapeIds);
-    const clusterLabel = toStringValue(arguments_.label, 'Cluster created');
-    const clusterText = `${clusterLabel} (${shapeIds.length} shapes)`;
-    const id = createOperationId('agent-cluster');
-    const operations: CanvasMutationOperation[] = [
+  if (toolName === 'delete_shape') {
+    const id = toShapeId(arguments_.id, 'delete-target');
+    return [
       {
-        kind: 'create',
+        kind: 'delete',
         targetIds: [id],
+        payload: {},
+      },
+    ];
+  }
+
+  if (toolName === 'cluster_shapes') {
+    const shapeIds = toUniqueShapeIds(arguments_.shapeIds);
+    if (shapeIds.length < 2) {
+      return [];
+    }
+    const clusterLabel = typeof arguments_.label === 'string' ? arguments_.label.trim() : '';
+    const groupId =
+      typeof arguments_.groupId === 'string' && arguments_.groupId.trim().length > 0
+        ? toShapeId(arguments_.groupId, 'agent-group')
+        : undefined;
+
+    return [
+      {
+        kind: 'batch',
+        targetIds: shapeIds,
         payload: {
-          shapeInput: {
-            id,
-            type: 'note',
-            x: 300,
-            y: 200,
-            props: {
-              richText: toRichText(clusterText),
-            },
-            meta: {
-              agentText: clusterText,
-              clusterId: id,
-              memberShapeIds: shapeIds,
-            },
-          },
+          groupShapeIds: shapeIds,
+          ...(groupId ? { groupId } : {}),
+          ...(clusterLabel.length > 0 ? { label: clusterLabel } : {}),
         },
       },
     ];
-
-    if (shapeIds.length > 0) {
-      for (const shapeId of shapeIds) {
-        operations.push({
-          kind: 'update',
-          targetIds: [shapeId],
-          payload: {
-            metaPatch: {
-              clusterId: id,
-              clusterLabel,
-              memberShapeIds: shapeIds,
-            },
-          },
-        });
-      }
-    }
-
-    return operations;
   }
 
   if (toolName === 'generate_image') {

@@ -157,7 +157,11 @@ export interface AgentContextResponse extends AgentContextRequest {
 
 export type ToolName =
   | 'place_sticky'
+  | 'place_geo'
+  | 'place_text'
   | 'draw_arrow'
+  | 'update_shape'
+  | 'delete_shape'
   | 'cluster_shapes'
   | 'summarize_region'
   | 'generate_image';
