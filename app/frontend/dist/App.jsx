@@ -104,6 +104,7 @@ function toShapeSnapshot(shape) {
     return {
         id: shape.id,
         kind,
+        type: typeof typedShape.type === 'string' ? typedShape.type : undefined,
         bounds: {
             x: typeof typedShape.x === 'number' ? typedShape.x : 0,
             y: typeof typedShape.y === 'number' ? typedShape.y : 0,
@@ -112,6 +113,7 @@ function toShapeSnapshot(shape) {
         },
         updatedAt: new Date().toISOString(),
         text: typeof typedShape.props?.text === 'string' ? typedShape.props.text : undefined,
+        props: typeof typedShape.props === 'object' && typedShape.props !== null ? typedShape.props : undefined,
         clusterId: typeof typedShape.meta?.clusterId === 'string'
             ? typedShape.meta.clusterId
             : undefined,
@@ -549,6 +551,10 @@ export function App(root, options = {}) {
             }
             if (parsed.result?.status === 'fallback') {
                 const fallbackActions = parsed.result.actions ?? [];
+                if (parsed.result.failure?.details) {
+                    // eslint-disable-next-line no-console
+                    console.warn('[agent] fallback diagnostics', parsed.result.failure.details);
+                }
                 setAgentUiState(false, `Fallback applied (${fallbackActions.length} action(s))`, parsed.result.error ?? parsed.result.failure?.message ?? '');
                 return;
             }

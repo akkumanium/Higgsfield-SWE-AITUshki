@@ -144,7 +144,7 @@ function getViewport(editor: Editor) {
 function toShapeSnapshot(shape: TLShape): CanvasShapeSnapshot {
   const typedShape = shape as TLShape & {
     type?: string;
-    props?: { text?: unknown; w?: unknown; h?: unknown };
+    props?: Record<string, unknown> & { text?: unknown; w?: unknown; h?: unknown };
     x?: number;
     y?: number;
     meta?: { clusterId?: unknown; memberShapeIds?: unknown };
@@ -168,6 +168,7 @@ function toShapeSnapshot(shape: TLShape): CanvasShapeSnapshot {
   return {
     id: shape.id,
     kind,
+    type: typeof typedShape.type === 'string' ? typedShape.type : undefined,
     bounds: {
       x: typeof typedShape.x === 'number' ? typedShape.x : 0,
       y: typeof typedShape.y === 'number' ? typedShape.y : 0,
@@ -176,6 +177,7 @@ function toShapeSnapshot(shape: TLShape): CanvasShapeSnapshot {
     },
     updatedAt: new Date().toISOString(),
     text: typeof typedShape.props?.text === 'string' ? typedShape.props.text : undefined,
+    props: typeof typedShape.props === 'object' && typedShape.props !== null ? typedShape.props : undefined,
     clusterId:
       typeof typedShape.meta?.clusterId === 'string'
         ? typedShape.meta.clusterId
@@ -694,6 +696,10 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
 
       if (parsed.result?.status === 'fallback') {
         const fallbackActions = parsed.result.actions ?? [];
+        if (parsed.result.failure?.details) {
+          // eslint-disable-next-line no-console
+          console.warn('[agent] fallback diagnostics', parsed.result.failure.details);
+        }
         setAgentUiState(
           false,
           `Fallback applied (${fallbackActions.length} action(s))`,

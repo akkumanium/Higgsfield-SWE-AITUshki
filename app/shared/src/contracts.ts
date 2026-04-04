@@ -134,9 +134,11 @@ export interface CanvasShapeBounds {
 export interface CanvasShapeSnapshot {
   id: CanvasShapeId;
   kind: CanvasShapeKind;
+  type?: string;
   bounds: CanvasShapeBounds;
   updatedAt: string;
   text?: string;
+  props?: Record<string, unknown>;
   clusterId?: string;
   memberShapeIds?: CanvasShapeId[];
 }

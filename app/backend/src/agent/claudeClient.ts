@@ -15,7 +15,7 @@ const geminiApiBaseUrl = 'https://generativelanguage.googleapis.com/v1beta';
 const defaultGeminiModel = 'gemini-2.5-flash';
 const defaultTimeoutMs = 20_000;
 const defaultMaxToolsPerTurn = 6;
-const defaultMaxOutputTokens = 1024;
+const defaultMaxOutputTokens = 4096;
 
 interface GeminiToolDeclaration {
   name: ToolName;
@@ -32,6 +32,20 @@ interface ContextShapePreview {
   kind: string;
   text: string;
   memberShapeCount: number;
+}
+
+function roundViewport(viewport: { x: number; y: number; width: number; height: number }): {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+} {
+  return {
+    x: Math.round(viewport.x),
+    y: Math.round(viewport.y),
+    width: Math.round(viewport.width),
+    height: Math.round(viewport.height),
+  };
 }
 
 function extractRichText(richText: unknown): string {
@@ -62,13 +76,41 @@ function extractRichText(richText: unknown): string {
   return walk(doc).replace(/\s+/g, ' ').trim();
 }
 
-function getContextShapePreviews(request: AgentTurnRequest): ContextShapePreview[] {
-  const rawContext = request.context as AgentTurnRequest['context'] & { shapes?: unknown };
-  if (!Array.isArray(rawContext.shapes)) {
-    return [];
+function extractTextFromShape(record: Record<string, unknown>): string {
+  const props =
+    typeof record.props === 'object' && record.props !== null
+      ? (record.props as Record<string, unknown>)
+      : {};
+
+  if (props.richText !== undefined) {
+    const richTextContent = extractRichText(props.richText);
+    if (richTextContent.length > 0) {
+      return richTextContent;
+    }
   }
 
-  return rawContext.shapes
+  const candidates = [props.text, props.name, props.label, record.text];
+  for (const value of candidates) {
+    if (typeof value === 'string') {
+      const normalized = value.trim();
+      if (normalized.length > 0) {
+        return normalized;
+      }
+    }
+  }
+
+  if (typeof props.url === 'string' && props.url.trim().length > 0) {
+    return `[url: ${props.url.trim()}]`;
+  }
+
+  return '';
+}
+
+function getContextShapePreviews(request: AgentTurnRequest): ContextShapePreview[] {
+  const rawContext = request.context as AgentTurnRequest['context'] & { shapes?: unknown };
+  const shapes = Array.isArray(rawContext.shapes) ? rawContext.shapes : [];
+
+  return shapes
     .slice(0, 32)
     .map((shape): ContextShapePreview | null => {
       if (typeof shape !== 'object' || shape === null) {
@@ -78,24 +120,12 @@ function getContextShapePreviews(request: AgentTurnRequest): ContextShapePreview
       const record = shape as Record<string, unknown>;
       const id = typeof record.id === 'string' ? record.id : 'unknown-shape';
       const kind =
-        typeof record.kind === 'string'
-          ? record.kind
-          : typeof record.type === 'string'
-            ? record.type
+        typeof record.type === 'string'
+          ? record.type
+          : typeof record.kind === 'string'
+            ? record.kind
             : 'unknown';
-      const props =
-        typeof record.props === 'object' && record.props !== null
-          ? (record.props as Record<string, unknown>)
-          : {};
-      const rawText =
-        typeof record.text === 'string'
-          ? record.text
-          : typeof props.text === 'string'
-            ? props.text
-            : props.richText !== undefined
-              ? extractRichText(props.richText)
-              : '';
-      const text = rawText.replace(/\s+/g, ' ').trim().slice(0, 1000);
+      const text = extractTextFromShape(record).slice(0, 1000);
       const memberShapeIds = Array.isArray(record.memberShapeIds) ? record.memberShapeIds : [];
 
       return {
@@ -115,13 +145,12 @@ function buildShapeContextText(request: AgentTurnRequest): string {
   }
 
   const lines = previews.map((shape) => {
-    const textPart = shape.text.length > 0 ? ` text="${shape.text}"` : '';
+    const textPart = shape.text.length > 0 ? ` text="${shape.text}"` : ' text=[no text content]';
     const membersPart = shape.memberShapeCount > 0 ? ` members=${shape.memberShapeCount}` : '';
     return `- ${shape.id} kind=${shape.kind}${membersPart}${textPart}`;
   });
 
-  // Label clearly so Gemini knows this is the content, not instructions
-  return ['[CANVAS SHAPES — this is the content to summarize, not the instructions below]', ...lines].join('\n');
+  return ['[CANVAS STATE - Read text content from here]', ...lines].join('\n');
 }
 
 function buildFallbackSummaryText(request: AgentTurnRequest): string {
@@ -218,23 +247,17 @@ function toFunctionDeclaration(schema: ReturnType<typeof getToolSchemas>[number]
   if (schema.name === 'summarize_region') {
     return {
       name: schema.name,
-      description: `${schema.description} Include a human-readable summary string in "summary".`,
+      description: `${schema.description} You MUST provide a detailed summary of the content in the "summary" field.`,
       parameters: {
         type: 'object',
         properties: {
-          region: {
-            type: 'object',
-            properties: {
-              x: { type: 'number' },
-              y: { type: 'number' },
-              width: { type: 'number' },
-              height: { type: 'number' },
-            },
-            required: ['x', 'y', 'width', 'height'],
-          },
-          summary: { type: 'string' },
+          x: { type: 'number' },
+          y: { type: 'number' },
+          width: { type: 'number' },
+          height: { type: 'number' },
+          summary: { type: 'string', description: 'The human-readable summary of the region.' },
         },
-        required: ['region'],
+        required: ['x', 'y', 'width', 'height', 'summary'],
       },
     };
   }
@@ -257,6 +280,7 @@ function toFunctionDeclaration(schema: ReturnType<typeof getToolSchemas>[number]
 function inferToolPlanHeuristic(request: AgentTurnRequest): Array<{ toolName: ToolName; arguments: Record<string, unknown> }> {
   const prompt = request.prompt.toLowerCase();
   const viewport = request.context.viewport;
+  const roundedViewport = roundViewport(viewport);
 
   if (prompt.includes('arrow')) {
     return [
@@ -313,7 +337,7 @@ function inferToolPlanHeuristic(request: AgentTurnRequest): Array<{ toolName: To
       {
         toolName: 'summarize_region',
         arguments: {
-          region: viewport,
+          region: roundedViewport,
           summary: buildFallbackSummaryText(request),
         },
       },
@@ -375,6 +399,91 @@ interface GeminiResponse {
 interface ToolPlanInferenceResult {
   plan: Array<{ toolName: ToolName; arguments: Record<string, unknown> }>;
   fallbackFailure?: FailureEnvelope;
+}
+
+interface GeminiToolCallDebugSummary {
+  candidateCount: number;
+  firstCandidatePartCount: number;
+  firstCandidateRawPreview?: string;
+  firstCandidateTextParts: string[];
+  firstCandidateFunctionCalls: Array<{
+    name: string | null;
+    argsType: string;
+    argsPreview?: string;
+  }>;
+}
+
+function getConfiguredGeminiDebug(): boolean {
+  const value = (getEnv('GEMINI_DEBUG_TOOL_CALLS') ?? '').trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+}
+
+function truncateText(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function summarizeGeminiResponseForDebug(parsed: GeminiResponse): GeminiToolCallDebugSummary {
+  const firstCandidateParts = parsed.candidates?.[0]?.content?.parts ?? [];
+  let firstCandidateRawPreview: string | undefined;
+  try {
+    const firstCandidate = parsed.candidates?.[0];
+    if (firstCandidate !== undefined) {
+      firstCandidateRawPreview = truncateText(JSON.stringify(firstCandidate), 1200);
+    }
+  } catch {
+    firstCandidateRawPreview = '<unserializable>';
+  }
+
+  const textParts = firstCandidateParts
+    .map((part) => {
+      const maybeText = (part as Record<string, unknown>).text;
+      return typeof maybeText === 'string' ? maybeText : null;
+    })
+    .filter((value): value is string => value !== null)
+    .map((value) => truncateText(value.replace(/\s+/g, ' ').trim(), 240));
+
+  const functionCalls = firstCandidateParts
+    .map((part) => {
+      const functionCall = part.functionCall;
+      if (!functionCall) {
+        return null;
+      }
+
+      const name = typeof functionCall.name === 'string' ? functionCall.name : null;
+      const argsType = Array.isArray(functionCall.args)
+        ? 'array'
+        : functionCall.args === null
+          ? 'null'
+          : typeof functionCall.args;
+
+      let argsPreview: string | undefined;
+      try {
+        if (functionCall.args !== undefined) {
+          argsPreview = truncateText(JSON.stringify(functionCall.args), 240);
+        }
+      } catch {
+        argsPreview = '<unserializable>';
+      }
+
+      return {
+        name,
+        argsType,
+        argsPreview,
+      };
+    })
+    .filter((value): value is NonNullable<typeof value> => value !== null);
+
+  return {
+    candidateCount: parsed.candidates?.length ?? 0,
+    firstCandidatePartCount: firstCandidateParts.length,
+    firstCandidateRawPreview,
+    firstCandidateTextParts: textParts,
+    firstCandidateFunctionCalls: functionCalls,
+  };
 }
 
 function parseToolArguments(value: unknown): Record<string, unknown> | null {
@@ -464,7 +573,7 @@ async function inferToolPlanFromGemini(
                 text: [
                   '=== CANVAS STATE ===',
                   `Room: ${request.roomId}`,
-                  `Viewport: ${JSON.stringify(request.context.viewport)}`,
+                  `Viewport: ${JSON.stringify(roundViewport(request.context.viewport))}`,
                   buildShapeContextText(request),
                   '=== USER REQUEST ===',
                   request.prompt,
@@ -520,16 +629,36 @@ async function inferToolPlanFromGemini(
       };
     }
 
+    const debugSummary = summarizeGeminiResponseForDebug(parsed);
+    const droppedDiagnostics = {
+      missingFunctionCall: 0,
+      missingName: 0,
+      unknownToolName: 0,
+      invalidArguments: 0,
+    };
+
     const parts = parsed.candidates?.[0]?.content?.parts ?? [];
     const plannedTools = parts.flatMap((part) => {
       const functionCall = part.functionCall;
       if (!functionCall) {
+        droppedDiagnostics.missingFunctionCall += 1;
         return [];
       }
 
       const name = typeof functionCall.name === 'string' ? functionCall.name : '';
       const arguments_ = parseToolArguments(functionCall.args);
-      if (!name || !arguments_ || !isKnownToolName(name)) {
+      if (!name) {
+        droppedDiagnostics.missingName += 1;
+        return [];
+      }
+
+      if (!isKnownToolName(name)) {
+        droppedDiagnostics.unknownToolName += 1;
+        return [];
+      }
+
+      if (!arguments_) {
+        droppedDiagnostics.invalidArguments += 1;
         return [];
       }
 
@@ -547,12 +676,44 @@ async function inferToolPlanFromGemini(
       };
     }
 
+    const diagnosticPayload = {
+      roomId: request.roomId,
+      turnId: request.turnId,
+      droppedDiagnostics,
+      geminiResponse: debugSummary,
+    };
+
+    // Always log — the GEMINI_DEBUG_TOOL_CALLS gate was hiding the root cause.
+    // eslint-disable-next-line no-console
+    console.warn('[gemini] no tool calls returned', JSON.stringify(diagnosticPayload, null, 2));
+
+    const dropReasons = Object.entries(droppedDiagnostics)
+      .filter(([, count]) => count > 0)
+      .map(([reason, count]) => `${reason}=${count}`)
+      .join(', ');
+
+    const candidateSummary = `candidates=${debugSummary.candidateCount} parts=${debugSummary.firstCandidatePartCount}`;
+    const textPreview =
+      debugSummary.firstCandidateTextParts.length > 0
+        ? ` textParts=[${debugSummary.firstCandidateTextParts.map((t) => `"${t}"`).join(', ')}]`
+        : '';
+
+    const verboseMessage = [
+      'Gemini returned no usable tool calls. Applied heuristic fallback instead.',
+      `  Response: ${candidateSummary}${textPreview}`,
+      dropReasons.length > 0
+        ? `  Dropped parts: ${dropReasons}`
+        : '  No parts with functionCall were present.',
+      '  Raw preview: ' + (debugSummary.firstCandidateRawPreview ?? '(empty)'),
+    ].join('\n');
+
     return {
       plan: inferToolPlanHeuristic(request),
       fallbackFailure: {
         code: 'provider_error',
-        message: 'Gemini returned no tool calls. Applied heuristic fallback instead.',
+        message: verboseMessage,
         retryable: true,
+        details: diagnosticPayload,
       },
     };
   } catch (error) {
@@ -690,8 +851,27 @@ export async function streamGeminiTurn(request: AgentTurnRequest): Promise<Agent
       toolCall: validatedToolEnvelope,
     });
 
+    // Re-nest flat summarize_region args that were flattened for Gemini compatibility.
+    let envelopeForExecution = validatedToolEnvelope;
+    if (validatedToolEnvelope.toolName === 'summarize_region') {
+      const args = validatedToolEnvelope.arguments as Record<string, unknown>;
+
+      // Heuristic path already provides nested region args; only re-nest flat Gemini args.
+      if (typeof args.region !== 'object' || args.region === null) {
+        const { x, y, width, height, summary, ...rest } = args;
+        envelopeForExecution = {
+          ...validatedToolEnvelope,
+          arguments: {
+            ...rest,
+            region: { x, y, width, height },
+            ...(summary !== undefined ? { summary } : {}),
+          },
+        };
+      }
+    }
+
     try {
-      const action = executeToolCall(request.roomId, validatedToolEnvelope);
+      const action = executeToolCall(request.roomId, envelopeForExecution);
       actions.push(action);
       events.push({
         type: 'agent.stream.action',
