@@ -100,10 +100,32 @@ function buildCanvasContextSummary(request) {
 // ---------------------------------------------------------------------------
 // System prompt
 // ---------------------------------------------------------------------------
-const SYSTEM_PROMPT = `
+function buildActionRulesPromptSection() {
+    return `## Canvas actions
+
+The app turns your JSON output into editor operations through action utils, so focus on intent and structure rather than low-level geometry.
+
+Available action vocabulary:
+- \`place_sticky\`: create a note-like canvas item for a single idea.
+- \`draw_arrow\`: connect two existing items with a relationship arrow.
+- \`cluster_shapes\`: group related items into a visual cluster when that helps comprehension.
+- \`summarize_region\`: compress a crowded area into a compact summary note.
+- \`generate_image\`: reserve a placeholder for an image when the user explicitly wants one.
+
+Action rules:
+- Use the smallest action set that solves the request.
+- Prefer clear relationships over decorative complexity.
+- Keep text short enough to fit comfortably in the resulting canvas item.
+- Only reference ids that already exist in your JSON output.
+- Do not invent unsupported action names or extra response fields.`.trim();
+}
+function buildSystemPrompt() {
+    return `
 You are an AI canvas planner. Given a user prompt, decide what to create on a collaborative canvas.
 
 Return ONLY a valid JSON object. No markdown, no code fences, no explanation — raw JSON only.
+
+${buildActionRulesPromptSection()}
 
 Schema:
 {
@@ -150,6 +172,7 @@ Prompt: "steps to launch a startup" →
 Prompt: "what can you do?" →
 { "layout": "free", "nodes": [], "edges": [], "message": "I can create mind maps, step-by-step flows, comparison grids, or freeform notes. Just describe what you want on the canvas." }
 `.trim();
+}
 // ---------------------------------------------------------------------------
 // AIPlan validation and sanitization
 // ---------------------------------------------------------------------------
@@ -291,7 +314,7 @@ async function callPlannerAI(request, maxNodes) {
                     maxOutputTokens: getConfiguredMaxOutputTokens(),
                 },
                 systemInstruction: {
-                    parts: [{ text: SYSTEM_PROMPT }],
+                    parts: [{ text: buildSystemPrompt() }],
                 },
                 contents: [
                     { role: 'user', parts: [{ text: userContent }] },
