@@ -1,10 +1,32 @@
+// $env:GEMINI_API_KEY="your_api_key_here"
 import { executeToolCall } from './toolExecutor.js';
 import { createToolEnvelope, getToolSchemas, isKnownToolName, isToolEnabled } from './tools.js';
 const geminiApiBaseUrl = 'https://generativelanguage.googleapis.com/v1beta';
-const defaultGeminiModel = 'gemini-2.0-flash';
+const defaultGeminiModel = 'gemini-2.5-flash';
 const defaultTimeoutMs = 20_000;
 const defaultMaxToolsPerTurn = 6;
 const defaultMaxOutputTokens = 1024;
+function extractRichText(richText) {
+    if (typeof richText !== 'object' || richText === null) {
+        return '';
+    }
+    const root = richText;
+    const doc = root.doc ?? root;
+    function walk(node) {
+        if (typeof node !== 'object' || node === null) {
+            return '';
+        }
+        const record = node;
+        if (typeof record.text === 'string') {
+            return record.text;
+        }
+        if (Array.isArray(record.content)) {
+            return record.content.map(walk).join('');
+        }
+        return '';
+    }
+    return walk(doc).replace(/\s+/g, ' ').trim();
+}
 function getContextShapePreviews(request) {
     const rawContext = request.context;
     if (!Array.isArray(rawContext.shapes)) {
@@ -18,9 +40,22 @@ function getContextShapePreviews(request) {
         }
         const record = shape;
         const id = typeof record.id === 'string' ? record.id : 'unknown-shape';
-        const kind = typeof record.kind === 'string' ? record.kind : 'unknown';
-        const textValue = typeof record.text === 'string' ? record.text : '';
-        const text = textValue.replace(/\s+/g, ' ').trim().slice(0, 180);
+        const kind = typeof record.kind === 'string'
+            ? record.kind
+            : typeof record.type === 'string'
+                ? record.type
+                : 'unknown';
+        const props = typeof record.props === 'object' && record.props !== null
+            ? record.props
+            : {};
+        const rawText = typeof record.text === 'string'
+            ? record.text
+            : typeof props.text === 'string'
+                ? props.text
+                : props.richText !== undefined
+                    ? extractRichText(props.richText)
+                    : '';
+        const text = rawText.replace(/\s+/g, ' ').trim().slice(0, 1000);
         const memberShapeIds = Array.isArray(record.memberShapeIds) ? record.memberShapeIds : [];
         return {
             id,
@@ -41,19 +76,40 @@ function buildShapeContextText(request) {
         const membersPart = shape.memberShapeCount > 0 ? ` members=${shape.memberShapeCount}` : '';
         return `- ${shape.id} kind=${shape.kind}${membersPart}${textPart}`;
     });
-    return ['Visible shapes:', ...lines].join('\n');
+    // Label clearly so Gemini knows this is the content, not instructions
+    return ['[CANVAS SHAPES — this is the content to summarize, not the instructions below]', ...lines].join('\n');
 }
 function buildFallbackSummaryText(request) {
     const previews = getContextShapePreviews(request);
     if (previews.length === 0) {
-        return 'No visible shapes to summarize yet. Add notes or objects in the viewport and ask again for a focused summary.';
+        return 'No visible shapes to summarize. Add content to the canvas first.';
     }
     const textual = previews.filter((shape) => shape.text.length > 0).map((shape) => shape.text);
-    const topIdeas = textual.slice(0, 4);
-    if (topIdeas.length === 0) {
-        return `Found ${previews.length} visible shapes, but they do not contain readable text. Add short labels to shapes for a richer summary.`;
+    const kindCounts = previews.reduce((accumulator, shape) => {
+        accumulator[shape.kind] = (accumulator[shape.kind] ?? 0) + 1;
+        return accumulator;
+    }, {});
+    const kindSummary = Object.entries(kindCounts)
+        .map(([kind, count]) => `${count} ${kind}${count > 1 ? 's' : ''}`)
+        .join(', ');
+    if (textual.length === 0) {
+        return `Canvas contains ${kindSummary} with no text labels yet.`;
     }
-    return `Summary (${previews.length} shapes): ${topIdeas.join(' | ')}`;
+    return `${previews.length} shapes (${kindSummary}): ${textual.slice(0, 4).join(' | ')}`;
+}
+function extractNoteText(prompt) {
+    const patterns = [
+        /make a note (?:saying|that|:)\s+["']?(.+?)["']?$/i,
+        /add a (?:sticky )?note (?:saying|that|:)\s+["']?(.+?)["']?$/i,
+        /(?:write|put|place)(?: a note)?(?:\s+saying|:)?\s+["']?(.+?)["']?$/i,
+    ];
+    for (const pattern of patterns) {
+        const match = prompt.match(pattern);
+        if (match?.[1]) {
+            return match[1].trim();
+        }
+    }
+    return prompt;
 }
 function toFunctionDeclaration(schema) {
     if (schema.name === 'place_sticky') {
@@ -139,7 +195,7 @@ function toFunctionDeclaration(schema) {
         },
     };
 }
-function inferToolPlan(request) {
+function inferToolPlanHeuristic(request) {
     const prompt = request.prompt.toLowerCase();
     const viewport = request.context.viewport;
     if (prompt.includes('arrow')) {
@@ -205,7 +261,7 @@ function inferToolPlan(request) {
             arguments: {
                 x: viewport.x + viewport.width / 2,
                 y: viewport.y + viewport.height / 2,
-                text: request.prompt,
+                text: extractNoteText(request.prompt),
             },
         },
     ];
@@ -248,7 +304,14 @@ function parseToolArguments(value) {
 async function inferToolPlanFromGemini(request) {
     const apiKey = getConfiguredApiKey();
     if (!apiKey) {
-        return inferToolPlan(request);
+        return {
+            plan: inferToolPlanHeuristic(request),
+            fallbackFailure: {
+                code: 'provider_error',
+                message: 'Gemini API key is not configured (set GEMINI_API_KEY or GOOGLE_API_KEY). Applied heuristic fallback instead.',
+                retryable: false,
+            },
+        };
     }
     const timeoutMs = getConfiguredTimeoutMs();
     const model = getConfiguredModel();
@@ -270,20 +333,32 @@ async function inferToolPlanFromGemini(request) {
                         functionDeclarations: getToolSchemas().map((schema) => toFunctionDeclaration(schema)),
                     },
                 ],
+                systemInstruction: {
+                    parts: [
+                        {
+                            text: [
+                                'You are an AI canvas assistant that calls tools to manipulate a canvas.',
+                                'When asked to summarize, call summarize_region EXACTLY ONCE.',
+                                'Your "summary" field must summarize the actual text content and meaning of the shapes listed in the CANVAS STATE section. Do not just describe their existence or layout — read the text.',
+                                "For place_sticky, 'text' must contain ONLY the note content, never the user's instruction text.",
+                                'Do not return placeholder text.',
+                                'If the request implies multiple distinct operations, emit one tool call per operation, up to 6 per turn.',
+                            ].join('\n'),
+                        },
+                    ],
+                },
                 contents: [
                     {
                         role: 'user',
                         parts: [
                             {
                                 text: [
-                                    'You are an AI canvas assistant that MUST call tools instead of freeform drawing.',
+                                    '=== CANVAS STATE ===',
                                     `Room: ${request.roomId}`,
-                                    `Prompt: ${request.prompt}`,
                                     `Viewport: ${JSON.stringify(request.context.viewport)}`,
                                     buildShapeContextText(request),
-                                    'If you choose summarize_region, include a concise, useful summary in the "summary" field (2-4 sentences).',
-                                    'Do not return placeholder text or coordinate-only summaries.',
-                                    'Choose the single best tool call for this turn unless multiple are absolutely required.',
+                                    '=== USER REQUEST ===',
+                                    request.prompt,
                                 ].join('\n'),
                             },
                         ],
@@ -293,9 +368,45 @@ async function inferToolPlanFromGemini(request) {
             signal: controller.signal,
         });
         if (!response.ok) {
-            return inferToolPlan(request);
+            let providerMessage = `Gemini request failed with HTTP ${response.status}.`;
+            try {
+                const errorPayload = (await response.json());
+                if (typeof errorPayload.error?.message === 'string' && errorPayload.error.message.trim().length > 0) {
+                    providerMessage = `Gemini request failed (${response.status}): ${errorPayload.error.message}`;
+                }
+            }
+            catch {
+                // Keep the generic provider message when error payload parsing fails.
+            }
+            return {
+                plan: inferToolPlanHeuristic(request),
+                fallbackFailure: {
+                    code: 'provider_error',
+                    message: `${providerMessage} Applied heuristic fallback instead.`,
+                    retryable: response.status === 429 || response.status >= 500,
+                    details: {
+                        httpStatus: response.status,
+                    },
+                },
+            };
         }
         const parsed = (await response.json());
+        if (parsed.error) {
+            const providerMessage = typeof parsed.error.message === 'string' && parsed.error.message.trim().length > 0
+                ? parsed.error.message
+                : 'Gemini returned an error payload.';
+            return {
+                plan: inferToolPlanHeuristic(request),
+                fallbackFailure: {
+                    code: 'provider_error',
+                    message: `Gemini provider error: ${providerMessage} Applied heuristic fallback instead.`,
+                    retryable: true,
+                    details: {
+                        providerCode: parsed.error.code,
+                    },
+                },
+            };
+        }
         const parts = parsed.candidates?.[0]?.content?.parts ?? [];
         const plannedTools = parts.flatMap((part) => {
             const functionCall = part.functionCall;
@@ -314,10 +425,30 @@ async function inferToolPlanFromGemini(request) {
                 },
             ];
         });
-        return plannedTools.length > 0 ? plannedTools : inferToolPlan(request);
+        if (plannedTools.length > 0) {
+            return {
+                plan: plannedTools,
+            };
+        }
+        return {
+            plan: inferToolPlanHeuristic(request),
+            fallbackFailure: {
+                code: 'provider_error',
+                message: 'Gemini returned no tool calls. Applied heuristic fallback instead.',
+                retryable: true,
+            },
+        };
     }
-    catch {
-        return inferToolPlan(request);
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown Gemini request error.';
+        return {
+            plan: inferToolPlanHeuristic(request),
+            fallbackFailure: {
+                code: 'provider_error',
+                message: `Gemini request failed (${message}). Applied heuristic fallback instead.`,
+                retryable: true,
+            },
+        };
     }
     finally {
         clearTimeout(timer);
@@ -331,8 +462,20 @@ export async function streamGeminiTurn(request) {
             at: new Date().toISOString(),
         },
     ];
-    const maxToolsPerTurn = Number(getEnv('AGENT_MAX_TOOLS_PER_TURN') ?? defaultMaxToolsPerTurn);
-    const toolPlan = (await inferToolPlanFromGemini(request)).filter((entry) => isKnownToolName(entry.toolName));
+    const configuredMaxToolsPerTurn = Number(getEnv('AGENT_MAX_TOOLS_PER_TURN') ?? defaultMaxToolsPerTurn);
+    const maxToolsPerTurn = Number.isFinite(configuredMaxToolsPerTurn) && configuredMaxToolsPerTurn > 0
+        ? Math.floor(configuredMaxToolsPerTurn)
+        : defaultMaxToolsPerTurn;
+    const inferred = await inferToolPlanFromGemini(request);
+    const toolPlan = inferred.plan.filter((entry) => isKnownToolName(entry.toolName));
+    if (inferred.fallbackFailure) {
+        events.push({
+            type: 'agent.stream.delta',
+            turnId: request.turnId,
+            at: new Date().toISOString(),
+            delta: inferred.fallbackFailure.message,
+        });
+    }
     if (toolPlan.length > maxToolsPerTurn) {
         const failure = {
             code: 'invalid_request',
@@ -463,9 +606,12 @@ export async function streamGeminiTurn(request) {
     return {
         turnId: request.turnId,
         accepted: true,
-        status: 'completed',
+        status: inferred.fallbackFailure ? 'fallback' : 'completed',
         actions,
+        suggestedActions: inferred.fallbackFailure ? actions : undefined,
         events,
+        failure: inferred.fallbackFailure,
+        error: inferred.fallbackFailure?.message,
     };
 }
 //# sourceMappingURL=claudeClient.js.map

@@ -43,7 +43,6 @@ export function isToolEnabled(toolName) {
 export function getToolSchemas() {
     return BASE_TOOL_SCHEMAS.filter((schema) => isToolEnabled(schema.name));
 }
-export const TOOL_SCHEMAS = getToolSchemas();
 export function isKnownToolName(name) {
     return getToolSchemas().some((schema) => schema.name === name);
 }

@@ -6,7 +6,6 @@ export interface ToolSchema {
 }
 export declare function isToolEnabled(toolName: ToolName): boolean;
 export declare function getToolSchemas(): ToolSchema[];
-export declare const TOOL_SCHEMAS: ToolSchema[];
 export declare function isKnownToolName(name: string): name is ToolName;
 export declare function validateToolArguments(toolName: ToolName, arguments_: Record<string, unknown>): {
     valid: boolean;

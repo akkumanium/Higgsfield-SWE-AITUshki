@@ -693,12 +693,12 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
       }
 
       if (parsed.result?.status === 'fallback') {
-        const fallbackActions = parsed.result.suggestedActions ?? [];
-        for (const suggested of parsed.result.suggestedActions ?? []) {
-          applyRemote(suggested);
-          sync.sendAction(suggested);
-        }
-        setAgentUiState(false, `Fallback applied (${fallbackActions.length} suggestion(s))`, '');
+        const fallbackActions = parsed.result.actions ?? [];
+        setAgentUiState(
+          false,
+          `Fallback applied (${fallbackActions.length} action(s))`,
+          parsed.result.error ?? parsed.result.failure?.message ?? '',
+        );
         return;
       }
       if (parsed.result?.status === 'failed') {
