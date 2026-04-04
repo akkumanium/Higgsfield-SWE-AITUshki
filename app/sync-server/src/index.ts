@@ -1,8 +1,10 @@
 import {
   type CanvasActionEnvelope,
+  type FailureEnvelope,
   type SyncClientActionMessage,
   type SyncClientJoinMessage,
   type SyncClientMessage,
+  type SyncServerActionAckMessage,
   type SyncServerActionMessage,
   type SyncServerErrorMessage,
   type SyncServerMessage,
@@ -47,6 +49,7 @@ interface RoomState {
   record: SyncRoomRecord;
   clients: Set<RuntimeSocket>;
   actions: CanvasActionEnvelope[];
+  seenActionIds: Set<string>;
 }
 
 export interface StartedSyncServer {
@@ -66,6 +69,10 @@ const roomBySocket = new Map<RuntimeSocket, string>();
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
+}
+
+function createId(prefix: string): string {
+  return `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function parseClientMessage(raw: string): SyncClientMessage | null {
@@ -101,6 +108,7 @@ function getOrCreateRoom(roomId: string): RoomState {
     },
     clients: new Set<RuntimeSocket>(),
     actions: [],
+    seenActionIds: new Set<string>(),
   };
   syncRooms.set(roomId, createdRoom);
   return createdRoom;
@@ -169,23 +177,49 @@ function leaveRoom(socket: RuntimeSocket) {
 function handleAction(socket: RuntimeSocket, actionMessage: SyncClientActionMessage) {
   const room = syncRooms.get(actionMessage.roomId);
   if (!room) {
+    const failure: FailureEnvelope = {
+      code: 'invalid_request',
+      message: `Room not found: ${actionMessage.roomId}`,
+      retryable: false,
+    };
     const errorMessage: SyncServerErrorMessage = {
       type: 'error',
+      messageId: createId('error'),
       roomId: actionMessage.roomId,
-      message: `Room not found: ${actionMessage.roomId}`,
+      message: failure.message,
+      failure,
     };
     socket.send(serializeServerMessage(errorMessage));
     return;
   }
 
+  const duplicate = room.seenActionIds.has(actionMessage.action.id);
+  const ackMessage: SyncServerActionAckMessage = {
+    type: 'room.ack',
+    messageId: createId('ack'),
+    roomId: actionMessage.roomId,
+    actionId: actionMessage.action.id,
+    accepted: true,
+    duplicate,
+  };
+  socket.send(serializeServerMessage(ackMessage));
+
+  if (duplicate) {
+    return;
+  }
+
   room.actions.push(actionMessage.action);
+  room.seenActionIds.add(actionMessage.action.id);
   if (room.actions.length > maxRoomActionHistory) {
     room.actions.splice(0, room.actions.length - maxRoomActionHistory);
+    room.seenActionIds = new Set(room.actions.map((action) => action.id));
   }
 
   const serverAction: SyncServerActionMessage = {
     type: 'room.action',
+    messageId: createId('room-action'),
     roomId: actionMessage.roomId,
+    metadata: actionMessage.metadata,
     action: actionMessage.action,
   };
   broadcastToRoom(room, serverAction, socket);

@@ -6,7 +6,7 @@ export interface ToolSchema {
   requiredKeys: string[];
 }
 
-export const TOOL_SCHEMAS: ToolSchema[] = [
+const BASE_TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'place_sticky',
     description: 'Create a note-like shape in the current room.',
@@ -34,12 +34,37 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
 ];
 
+function getEnv(name: string): string | undefined {
+  const maybeProcess = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
+  return maybeProcess?.env?.[name];
+}
+
+export function isToolEnabled(toolName: ToolName): boolean {
+  if (toolName !== 'generate_image') {
+    return true;
+  }
+
+  const flag = getEnv('ENABLE_STRETCH_FEATURES');
+  if (!flag) {
+    return false;
+  }
+
+  const normalized = flag.trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+}
+
+export function getToolSchemas(): ToolSchema[] {
+  return BASE_TOOL_SCHEMAS.filter((schema) => isToolEnabled(schema.name));
+}
+
+export const TOOL_SCHEMAS = getToolSchemas();
+
 export function isKnownToolName(name: string): name is ToolName {
-  return TOOL_SCHEMAS.some((schema) => schema.name === name);
+  return getToolSchemas().some((schema) => schema.name === name);
 }
 
 export function validateToolArguments(toolName: ToolName, arguments_: Record<string, unknown>) {
-  const schema = TOOL_SCHEMAS.find((tool) => tool.name === toolName);
+  const schema = getToolSchemas().find((tool) => tool.name === toolName);
   if (!schema) {
     return {
       valid: false,

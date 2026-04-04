@@ -7,6 +7,13 @@
     "check": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@ai-canvas/shared": "workspace:*"
+    "@ai-canvas/shared": "workspace:*",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tldraw": "^3.8.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1"
   }
 }

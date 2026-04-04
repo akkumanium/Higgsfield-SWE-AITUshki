@@ -5,7 +5,8 @@
     "app/*"
   ],
   "scripts": {
-    "build": "tsc -b app/shared app/frontend app/backend app/sync-server",
-    "check": "tsc -b --pretty false"
+    "build": "tsc -b app/shared app/frontend app/backend app/sync-server app/e2e",
+    "check": "tsc -b --pretty false",
+    "smoke": "npm run smoke -w @ai-canvas/e2e"
   }
 }

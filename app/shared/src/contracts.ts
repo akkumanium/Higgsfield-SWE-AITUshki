@@ -4,6 +4,36 @@ export type AgentTurnId = string;
 
 export type CanvasShapeId = string;
 export type CanvasActionId = string;
+export type MessageId = string;
+export type IdempotencyKey = string;
+
+export type FailureCode =
+  | 'invalid_request'
+  | 'malformed_tool_call'
+  | 'tool_validation_failed'
+  | 'sync_unavailable'
+  | 'timeout'
+  | 'cancelled'
+  | 'provider_error'
+  | 'internal_error';
+
+export interface FailureEnvelope {
+  code: FailureCode;
+  message: string;
+  retryable: boolean;
+  details?: Record<string, unknown>;
+}
+
+export interface RetryMetadata {
+  attempt: number;
+  maxAttempts: number;
+}
+
+export interface RequestMetadata extends RetryMetadata {
+  requestId: MessageId;
+  idempotencyKey: IdempotencyKey;
+  sentAt: string;
+}
 
 export type SyncConnectionStatus = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'error';
 
@@ -19,12 +49,15 @@ export interface SyncConnectionState {
 
 export interface SyncClientJoinMessage {
   type: 'join';
+  messageId: MessageId;
   roomId: RoomId;
   sessionId: SessionId;
 }
 
 export interface SyncClientActionMessage {
   type: 'action';
+  messageId: MessageId;
+  metadata: RequestMetadata;
   roomId: RoomId;
   sessionId: SessionId;
   action: CanvasActionEnvelope;
@@ -32,6 +65,7 @@ export interface SyncClientActionMessage {
 
 export interface SyncClientPresencePingMessage {
   type: 'presence.ping';
+  messageId: MessageId;
   roomId: RoomId;
   sessionId: SessionId;
   at: string;
@@ -51,8 +85,20 @@ export interface SyncServerSnapshotMessage {
 
 export interface SyncServerActionMessage {
   type: 'room.action';
+  messageId: MessageId;
   roomId: RoomId;
+  metadata?: RequestMetadata;
   action: CanvasActionEnvelope;
+}
+
+export interface SyncServerActionAckMessage {
+  type: 'room.ack';
+  messageId: MessageId;
+  roomId: RoomId;
+  actionId: CanvasActionId;
+  accepted: boolean;
+  duplicate: boolean;
+  failure?: FailureEnvelope;
 }
 
 export interface SyncServerPresenceMessage {
@@ -63,13 +109,16 @@ export interface SyncServerPresenceMessage {
 
 export interface SyncServerErrorMessage {
   type: 'error';
+  messageId: MessageId;
   roomId: RoomId;
   message: string;
+  failure?: FailureEnvelope;
 }
 
 export type SyncServerMessage =
   | SyncServerSnapshotMessage
   | SyncServerActionMessage
+  | SyncServerActionAckMessage
   | SyncServerPresenceMessage
   | SyncServerErrorMessage;
 
@@ -118,6 +167,14 @@ export interface ToolCallEnvelope {
   arguments: Record<string, unknown>;
 }
 
+export interface ToolCallDeltaEnvelope {
+  id: CanvasActionId;
+  turnId: AgentTurnId;
+  toolName?: ToolName;
+  fragment: string;
+  completed: boolean;
+}
+
 export interface CanvasActionEnvelope {
   id: CanvasActionId;
   roomId: RoomId;
@@ -146,13 +203,75 @@ export interface AgentTurnRequest {
   turnId: AgentTurnId;
   prompt: string;
   context: AgentContextRequest;
+  metadata?: RequestMetadata;
 }
+
+export interface AgentStreamStartedEvent {
+  type: 'agent.stream.started';
+  turnId: AgentTurnId;
+  at: string;
+}
+
+export interface AgentStreamTextDeltaEvent {
+  type: 'agent.stream.delta';
+  turnId: AgentTurnId;
+  delta: string;
+  at: string;
+}
+
+export interface AgentStreamToolCallDeltaEvent {
+  type: 'agent.stream.tool_call.delta';
+  turnId: AgentTurnId;
+  toolCall: ToolCallDeltaEnvelope;
+  at: string;
+}
+
+export interface AgentStreamToolCallCompletedEvent {
+  type: 'agent.stream.tool_call.completed';
+  turnId: AgentTurnId;
+  toolCall: ToolCallEnvelope;
+  at: string;
+}
+
+export interface AgentStreamActionEvent {
+  type: 'agent.stream.action';
+  turnId: AgentTurnId;
+  action: CanvasActionEnvelope;
+  at: string;
+}
+
+export interface AgentStreamCompletedEvent {
+  type: 'agent.stream.completed';
+  turnId: AgentTurnId;
+  at: string;
+}
+
+export interface AgentStreamFailedEvent {
+  type: 'agent.stream.failed';
+  turnId: AgentTurnId;
+  at: string;
+  failure: FailureEnvelope;
+}
+
+export type AgentStreamEvent =
+  | AgentStreamStartedEvent
+  | AgentStreamTextDeltaEvent
+  | AgentStreamToolCallDeltaEvent
+  | AgentStreamToolCallCompletedEvent
+  | AgentStreamActionEvent
+  | AgentStreamCompletedEvent
+  | AgentStreamFailedEvent;
+
+export type AgentTurnStatus = 'accepted' | 'completed' | 'failed' | 'fallback';
 
 export interface AgentTurnResponse {
   turnId: AgentTurnId;
   accepted: boolean;
+  status: AgentTurnStatus;
   actions: CanvasActionEnvelope[];
+  events?: AgentStreamEvent[];
   suggestedActions?: CanvasActionEnvelope[];
+  failure?: FailureEnvelope;
   error?: string;
 }
 
