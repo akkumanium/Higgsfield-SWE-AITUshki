@@ -1,12 +1,30 @@
-export const syncServerPort = 3002;
+function getEnv(name) {
+    const maybeProcess = globalThis.process;
+    return maybeProcess?.env?.[name];
+}
+export const syncServerPort = (() => {
+    const configured = Number(getEnv('PORT') ?? getEnv('SYNC_SERVER_PORT') ?? 3002);
+    return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 3002;
+})();
 const maxRoomActionHistory = 500;
+const maxRoomChatHistory = 200;
 const syncRooms = new Map();
-const roomBySocket = new Map();
+const socketMembership = new Map();
 function isObject(value) {
     return typeof value === 'object' && value !== null;
 }
 function createId(prefix) {
     return `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
+}
+function sanitizeDisplayName(value, sessionId) {
+    if (typeof value !== 'string') {
+        return `User-${sessionId.slice(-4)}`;
+    }
+    const normalized = value.trim().replace(/\s{2,}/g, ' ');
+    if (normalized.length === 0) {
+        return `User-${sessionId.slice(-4)}`;
+    }
+    return normalized.slice(0, 48);
 }
 function parseClientMessage(raw) {
     try {
@@ -39,16 +57,22 @@ function getOrCreateRoom(roomId) {
         },
         clients: new Set(),
         actions: [],
+        chats: [],
+        participants: new Map(),
         seenActionIds: new Set(),
     };
     syncRooms.set(roomId, createdRoom);
     return createdRoom;
+}
+function listParticipants(room) {
+    return Array.from(room.participants.values()).sort((a, b) => a.displayName.localeCompare(b.displayName));
 }
 function roomPresenceMessage(room) {
     return {
         type: 'room.presence',
         roomId: room.record.roomId,
         connectedClients: room.record.connectedClients,
+        participants: listParticipants(room),
     };
 }
 function broadcastToRoom(room, message, exceptSocket) {
@@ -69,31 +93,70 @@ function updateRoomConnectedClients(room) {
 }
 function joinRoom(socket, joinMessage) {
     const room = getOrCreateRoom(joinMessage.roomId);
+    const now = new Date().toISOString();
+    const participant = {
+        roomId: joinMessage.roomId,
+        sessionId: joinMessage.sessionId,
+        displayName: sanitizeDisplayName(joinMessage.displayName, joinMessage.sessionId),
+        joinedAt: room.participants.get(joinMessage.sessionId)?.joinedAt ?? now,
+        lastSeenAt: now,
+    };
+    room.participants.set(joinMessage.sessionId, participant);
     room.clients.add(socket);
-    roomBySocket.set(socket, joinMessage.roomId);
+    socketMembership.set(socket, {
+        roomId: joinMessage.roomId,
+        sessionId: joinMessage.sessionId,
+    });
     updateRoomConnectedClients(room);
     const snapshot = {
         type: 'room.snapshot',
         roomId: room.record.roomId,
         actions: room.actions,
+        recentChats: room.chats,
+        participants: listParticipants(room),
         connectedClients: room.record.connectedClients,
     };
     socket.send(serializeServerMessage(snapshot));
     broadcastToRoom(room, roomPresenceMessage(room));
 }
 function leaveRoom(socket) {
-    const roomId = roomBySocket.get(socket);
-    if (!roomId) {
+    const membership = socketMembership.get(socket);
+    if (!membership) {
         return;
     }
-    const room = syncRooms.get(roomId);
-    roomBySocket.delete(socket);
+    const room = syncRooms.get(membership.roomId);
+    socketMembership.delete(socket);
     if (!room) {
         return;
     }
     room.clients.delete(socket);
+    let sessionStillConnected = false;
+    for (const entry of socketMembership.values()) {
+        if (entry.roomId === membership.roomId && entry.sessionId === membership.sessionId) {
+            sessionStillConnected = true;
+            break;
+        }
+    }
+    if (!sessionStillConnected) {
+        room.participants.delete(membership.sessionId);
+    }
     updateRoomConnectedClients(room);
     broadcastToRoom(room, roomPresenceMessage(room));
+}
+function handlePresencePing(pingMessage) {
+    const room = syncRooms.get(pingMessage.roomId);
+    if (!room) {
+        return;
+    }
+    const existing = room.participants.get(pingMessage.sessionId);
+    if (!existing) {
+        return;
+    }
+    room.participants.set(pingMessage.sessionId, {
+        ...existing,
+        displayName: sanitizeDisplayName(pingMessage.displayName ?? existing.displayName, pingMessage.sessionId),
+        lastSeenAt: typeof pingMessage.at === 'string' ? pingMessage.at : new Date().toISOString(),
+    });
 }
 function handleAction(socket, actionMessage) {
     const room = syncRooms.get(actionMessage.roomId);
@@ -141,6 +204,58 @@ function handleAction(socket, actionMessage) {
     };
     broadcastToRoom(room, serverAction, socket);
 }
+function handleChat(socket, chatMessage) {
+    const room = syncRooms.get(chatMessage.roomId);
+    if (!room) {
+        const failure = {
+            code: 'invalid_request',
+            message: `Room not found: ${chatMessage.roomId}`,
+            retryable: false,
+        };
+        const errorMessage = {
+            type: 'error',
+            messageId: createId('error'),
+            roomId: chatMessage.roomId,
+            message: failure.message,
+            failure,
+        };
+        socket.send(serializeServerMessage(errorMessage));
+        return;
+    }
+    const normalizedText = chatMessage.text.trim().slice(0, 2_000);
+    if (normalizedText.length === 0) {
+        return;
+    }
+    const now = new Date().toISOString();
+    const participant = {
+        roomId: chatMessage.roomId,
+        sessionId: chatMessage.sessionId,
+        displayName: sanitizeDisplayName(chatMessage.displayName, chatMessage.sessionId),
+        joinedAt: room.participants.get(chatMessage.sessionId)?.joinedAt ?? now,
+        lastSeenAt: now,
+    };
+    room.participants.set(chatMessage.sessionId, participant);
+    const chat = {
+        id: createId('chat'),
+        roomId: chatMessage.roomId,
+        sessionId: chatMessage.sessionId,
+        displayName: participant.displayName,
+        text: normalizedText,
+        mentionsAgent: Boolean(chatMessage.mentionsAgent),
+        createdAt: now,
+    };
+    room.chats.push(chat);
+    if (room.chats.length > maxRoomChatHistory) {
+        room.chats.splice(0, room.chats.length - maxRoomChatHistory);
+    }
+    const payload = {
+        type: 'room.chat',
+        roomId: chatMessage.roomId,
+        chat,
+    };
+    broadcastToRoom(room, payload);
+    broadcastToRoom(room, roomPresenceMessage(room));
+}
 function isLikelyJoinMessage(message) {
     return message.type === 'join' && typeof message.roomId === 'string' && typeof message.sessionId === 'string';
 }
@@ -149,6 +264,17 @@ function isLikelyActionMessage(message) {
         typeof message.roomId === 'string' &&
         typeof message.sessionId === 'string' &&
         isObject(message.action));
+}
+function isLikelyPresencePingMessage(message) {
+    return (message.type === 'presence.ping' &&
+        typeof message.roomId === 'string' &&
+        typeof message.sessionId === 'string');
+}
+function isLikelyChatMessage(message) {
+    return (message.type === 'chat.send' &&
+        typeof message.roomId === 'string' &&
+        typeof message.sessionId === 'string' &&
+        typeof message.text === 'string');
 }
 async function loadRuntimeModules() {
     const httpSpecifier = 'node:http';
@@ -210,6 +336,14 @@ export async function startSyncServer(port = syncServerPort) {
             }
             if (isLikelyActionMessage(message)) {
                 handleAction(socket, message);
+                return;
+            }
+            if (isLikelyPresencePingMessage(message)) {
+                handlePresencePing(message);
+                return;
+            }
+            if (isLikelyChatMessage(message)) {
+                handleChat(socket, message);
             }
         });
         socket.on('close', () => {

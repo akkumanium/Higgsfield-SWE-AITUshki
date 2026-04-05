@@ -1,3 +1,12 @@
+interface ImportMetaEnv {
+  readonly VITE_BACKEND_URL?: string;
+  readonly VITE_SYNC_URL?: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+
 declare module 'react-dom/client' {
   import type { ReactNode } from 'react';
 

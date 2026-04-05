@@ -1,6 +1,7 @@
 export type RoomId = string;
 export type SessionId = string;
 export type AgentTurnId = string;
+export type DisplayName = string;
 export type CanvasShapeId = string;
 export type CanvasActionId = string;
 export type MessageId = string;
@@ -31,11 +32,28 @@ export interface SyncConnectionState {
     lastUpdatedAt: string;
     error?: string;
 }
+export interface RoomParticipant {
+    roomId: RoomId;
+    sessionId: SessionId;
+    displayName: DisplayName;
+    joinedAt: string;
+    lastSeenAt: string;
+}
+export interface ChatMessageEnvelope {
+    id: MessageId;
+    roomId: RoomId;
+    sessionId: SessionId;
+    displayName: DisplayName;
+    text: string;
+    mentionsAgent: boolean;
+    createdAt: string;
+}
 export interface SyncClientJoinMessage {
     type: 'join';
     messageId: MessageId;
     roomId: RoomId;
     sessionId: SessionId;
+    displayName?: DisplayName;
 }
 export interface SyncClientActionMessage {
     type: 'action';
@@ -50,13 +68,26 @@ export interface SyncClientPresencePingMessage {
     messageId: MessageId;
     roomId: RoomId;
     sessionId: SessionId;
+    displayName?: DisplayName;
     at: string;
 }
-export type SyncClientMessage = SyncClientJoinMessage | SyncClientActionMessage | SyncClientPresencePingMessage;
+export interface SyncClientChatMessage {
+    type: 'chat.send';
+    messageId: MessageId;
+    roomId: RoomId;
+    sessionId: SessionId;
+    displayName?: DisplayName;
+    text: string;
+    mentionsAgent: boolean;
+    at: string;
+}
+export type SyncClientMessage = SyncClientJoinMessage | SyncClientActionMessage | SyncClientPresencePingMessage | SyncClientChatMessage;
 export interface SyncServerSnapshotMessage {
     type: 'room.snapshot';
     roomId: RoomId;
     actions: CanvasActionEnvelope[];
+    recentChats: ChatMessageEnvelope[];
+    participants: RoomParticipant[];
     connectedClients: number;
 }
 export interface SyncServerActionMessage {
@@ -79,6 +110,12 @@ export interface SyncServerPresenceMessage {
     type: 'room.presence';
     roomId: RoomId;
     connectedClients: number;
+    participants: RoomParticipant[];
+}
+export interface SyncServerChatMessage {
+    type: 'room.chat';
+    roomId: RoomId;
+    chat: ChatMessageEnvelope;
 }
 export interface SyncServerErrorMessage {
     type: 'error';
@@ -87,7 +124,7 @@ export interface SyncServerErrorMessage {
     message: string;
     failure?: FailureEnvelope;
 }
-export type SyncServerMessage = SyncServerSnapshotMessage | SyncServerActionMessage | SyncServerActionAckMessage | SyncServerPresenceMessage | SyncServerErrorMessage;
+export type SyncServerMessage = SyncServerSnapshotMessage | SyncServerActionMessage | SyncServerActionAckMessage | SyncServerPresenceMessage | SyncServerChatMessage | SyncServerErrorMessage;
 export type CanvasShapeKind = 'text' | 'sticky' | 'arrow' | 'cluster' | 'image' | 'unknown';
 export interface CanvasShapeBounds {
     x: number;
@@ -156,6 +193,13 @@ export interface AgentTurnRequest {
     turnId: AgentTurnId;
     prompt: string;
     context: AgentContextRequest;
+    invocation?: {
+        source: 'chat' | 'canvas' | 'panel';
+        displayName?: DisplayName;
+        rawPrompt?: string;
+        requireExplicitMention?: boolean;
+        mentionDetected?: boolean;
+    };
     metadata?: RequestMetadata;
 }
 export interface AgentStreamStartedEvent {

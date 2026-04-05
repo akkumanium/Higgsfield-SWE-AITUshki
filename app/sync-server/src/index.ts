@@ -1,20 +1,34 @@
 import {
+  type ChatMessageEnvelope,
   type CanvasActionEnvelope,
   type FailureEnvelope,
+  type RoomParticipant,
   type SyncClientActionMessage,
+  type SyncClientChatMessage,
   type SyncClientJoinMessage,
   type SyncClientMessage,
+  type SyncClientPresencePingMessage,
   type SyncServerActionAckMessage,
   type SyncServerActionMessage,
+  type SyncServerChatMessage,
   type SyncServerErrorMessage,
   type SyncServerMessage,
   type SyncServerPresenceMessage,
   type SyncServerSnapshotMessage,
 } from '@ai-canvas/shared';
 
-export const syncServerPort = 3002;
+function getEnv(name: string): string | undefined {
+  const maybeProcess = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
+  return maybeProcess?.env?.[name];
+}
+
+export const syncServerPort = (() => {
+  const configured = Number(getEnv('PORT') ?? getEnv('SYNC_SERVER_PORT') ?? 3002);
+  return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 3002;
+})();
 
 const maxRoomActionHistory = 500;
+const maxRoomChatHistory = 200;
 
 type RuntimeSocket = {
   readonly OPEN: number;
@@ -49,6 +63,8 @@ interface RoomState {
   record: SyncRoomRecord;
   clients: Set<RuntimeSocket>;
   actions: CanvasActionEnvelope[];
+  chats: ChatMessageEnvelope[];
+  participants: Map<string, RoomParticipant>;
   seenActionIds: Set<string>;
 }
 
@@ -65,7 +81,7 @@ interface RuntimeModules {
 }
 
 const syncRooms = new Map<string, RoomState>();
-const roomBySocket = new Map<RuntimeSocket, string>();
+const socketMembership = new Map<RuntimeSocket, { roomId: string; sessionId: string }>();
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -73,6 +89,17 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function createId(prefix: string): string {
   return `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function sanitizeDisplayName(value: unknown, sessionId: string): string {
+  if (typeof value !== 'string') {
+    return `User-${sessionId.slice(-4)}`;
+  }
+  const normalized = value.trim().replace(/\s{2,}/g, ' ');
+  if (normalized.length === 0) {
+    return `User-${sessionId.slice(-4)}`;
+  }
+  return normalized.slice(0, 48);
 }
 
 function parseClientMessage(raw: string): SyncClientMessage | null {
@@ -108,10 +135,16 @@ function getOrCreateRoom(roomId: string): RoomState {
     },
     clients: new Set<RuntimeSocket>(),
     actions: [],
+    chats: [],
+    participants: new Map<string, RoomParticipant>(),
     seenActionIds: new Set<string>(),
   };
   syncRooms.set(roomId, createdRoom);
   return createdRoom;
+}
+
+function listParticipants(room: RoomState): RoomParticipant[] {
+  return Array.from(room.participants.values()).sort((a, b) => a.displayName.localeCompare(b.displayName));
 }
 
 function roomPresenceMessage(room: RoomState): SyncServerPresenceMessage {
@@ -119,6 +152,7 @@ function roomPresenceMessage(room: RoomState): SyncServerPresenceMessage {
     type: 'room.presence',
     roomId: room.record.roomId,
     connectedClients: room.record.connectedClients,
+    participants: listParticipants(room),
   };
 }
 
@@ -142,15 +176,29 @@ function updateRoomConnectedClients(room: RoomState) {
 
 function joinRoom(socket: RuntimeSocket, joinMessage: SyncClientJoinMessage) {
   const room = getOrCreateRoom(joinMessage.roomId);
+  const now = new Date().toISOString();
+  const participant: RoomParticipant = {
+    roomId: joinMessage.roomId,
+    sessionId: joinMessage.sessionId,
+    displayName: sanitizeDisplayName(joinMessage.displayName, joinMessage.sessionId),
+    joinedAt: room.participants.get(joinMessage.sessionId)?.joinedAt ?? now,
+    lastSeenAt: now,
+  };
+  room.participants.set(joinMessage.sessionId, participant);
 
   room.clients.add(socket);
-  roomBySocket.set(socket, joinMessage.roomId);
+  socketMembership.set(socket, {
+    roomId: joinMessage.roomId,
+    sessionId: joinMessage.sessionId,
+  });
   updateRoomConnectedClients(room);
 
   const snapshot: SyncServerSnapshotMessage = {
     type: 'room.snapshot',
     roomId: room.record.roomId,
     actions: room.actions,
+    recentChats: room.chats,
+    participants: listParticipants(room),
     connectedClients: room.record.connectedClients,
   };
   socket.send(serializeServerMessage(snapshot));
@@ -158,20 +206,48 @@ function joinRoom(socket: RuntimeSocket, joinMessage: SyncClientJoinMessage) {
 }
 
 function leaveRoom(socket: RuntimeSocket) {
-  const roomId = roomBySocket.get(socket);
-  if (!roomId) {
+  const membership = socketMembership.get(socket);
+  if (!membership) {
     return;
   }
 
-  const room = syncRooms.get(roomId);
-  roomBySocket.delete(socket);
+  const room = syncRooms.get(membership.roomId);
+  socketMembership.delete(socket);
   if (!room) {
     return;
   }
 
   room.clients.delete(socket);
+  let sessionStillConnected = false;
+  for (const entry of socketMembership.values()) {
+    if (entry.roomId === membership.roomId && entry.sessionId === membership.sessionId) {
+      sessionStillConnected = true;
+      break;
+    }
+  }
+  if (!sessionStillConnected) {
+    room.participants.delete(membership.sessionId);
+  }
   updateRoomConnectedClients(room);
   broadcastToRoom(room, roomPresenceMessage(room));
+}
+
+function handlePresencePing(pingMessage: SyncClientPresencePingMessage) {
+  const room = syncRooms.get(pingMessage.roomId);
+  if (!room) {
+    return;
+  }
+
+  const existing = room.participants.get(pingMessage.sessionId);
+  if (!existing) {
+    return;
+  }
+
+  room.participants.set(pingMessage.sessionId, {
+    ...existing,
+    displayName: sanitizeDisplayName(pingMessage.displayName ?? existing.displayName, pingMessage.sessionId),
+    lastSeenAt: typeof pingMessage.at === 'string' ? pingMessage.at : new Date().toISOString(),
+  });
 }
 
 function handleAction(socket: RuntimeSocket, actionMessage: SyncClientActionMessage) {
@@ -225,6 +301,64 @@ function handleAction(socket: RuntimeSocket, actionMessage: SyncClientActionMess
   broadcastToRoom(room, serverAction, socket);
 }
 
+function handleChat(socket: RuntimeSocket, chatMessage: SyncClientChatMessage) {
+  const room = syncRooms.get(chatMessage.roomId);
+  if (!room) {
+    const failure: FailureEnvelope = {
+      code: 'invalid_request',
+      message: `Room not found: ${chatMessage.roomId}`,
+      retryable: false,
+    };
+    const errorMessage: SyncServerErrorMessage = {
+      type: 'error',
+      messageId: createId('error'),
+      roomId: chatMessage.roomId,
+      message: failure.message,
+      failure,
+    };
+    socket.send(serializeServerMessage(errorMessage));
+    return;
+  }
+
+  const normalizedText = chatMessage.text.trim().slice(0, 2_000);
+  if (normalizedText.length === 0) {
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const participant: RoomParticipant = {
+    roomId: chatMessage.roomId,
+    sessionId: chatMessage.sessionId,
+    displayName: sanitizeDisplayName(chatMessage.displayName, chatMessage.sessionId),
+    joinedAt: room.participants.get(chatMessage.sessionId)?.joinedAt ?? now,
+    lastSeenAt: now,
+  };
+  room.participants.set(chatMessage.sessionId, participant);
+
+  const chat: ChatMessageEnvelope = {
+    id: createId('chat'),
+    roomId: chatMessage.roomId,
+    sessionId: chatMessage.sessionId,
+    displayName: participant.displayName,
+    text: normalizedText,
+    mentionsAgent: Boolean(chatMessage.mentionsAgent),
+    createdAt: now,
+  };
+
+  room.chats.push(chat);
+  if (room.chats.length > maxRoomChatHistory) {
+    room.chats.splice(0, room.chats.length - maxRoomChatHistory);
+  }
+
+  const payload: SyncServerChatMessage = {
+    type: 'room.chat',
+    roomId: chatMessage.roomId,
+    chat,
+  };
+  broadcastToRoom(room, payload);
+  broadcastToRoom(room, roomPresenceMessage(room));
+}
+
 function isLikelyJoinMessage(message: SyncClientMessage): message is SyncClientJoinMessage {
   return message.type === 'join' && typeof message.roomId === 'string' && typeof message.sessionId === 'string';
 }
@@ -235,6 +369,23 @@ function isLikelyActionMessage(message: SyncClientMessage): message is SyncClien
     typeof message.roomId === 'string' &&
     typeof message.sessionId === 'string' &&
     isObject(message.action)
+  );
+}
+
+function isLikelyPresencePingMessage(message: SyncClientMessage): message is SyncClientPresencePingMessage {
+  return (
+    message.type === 'presence.ping' &&
+    typeof message.roomId === 'string' &&
+    typeof message.sessionId === 'string'
+  );
+}
+
+function isLikelyChatMessage(message: SyncClientMessage): message is SyncClientChatMessage {
+  return (
+    message.type === 'chat.send' &&
+    typeof message.roomId === 'string' &&
+    typeof message.sessionId === 'string' &&
+    typeof message.text === 'string'
   );
 }
 
@@ -316,6 +467,16 @@ export async function startSyncServer(port = syncServerPort): Promise<StartedSyn
 
       if (isLikelyActionMessage(message)) {
         handleAction(socket, message);
+        return;
+      }
+
+      if (isLikelyPresencePingMessage(message)) {
+        handlePresencePing(message);
+        return;
+      }
+
+      if (isLikelyChatMessage(message)) {
+        handleChat(socket, message);
       }
     });
 

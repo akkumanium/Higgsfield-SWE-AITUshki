@@ -6,6 +6,7 @@ const defaultMinTurnIntervalMs = 5_000;
 const defaultMaxActionsPerTurn = 50;
 
 const lastTurnBySession = new Map<string, number>();
+const dailyApiBaseUrl = 'https://api.daily.co/v1';
 
 function getEnv(name: string): string | undefined {
   const maybeProcess = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
@@ -26,6 +27,140 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+function isValidInvocation(value: unknown): boolean {
+  if (value === undefined) {
+    return true;
+  }
+
+  if (!isObject(value)) {
+    return false;
+  }
+
+  if (typeof value.source !== 'string' || !['chat', 'canvas', 'panel'].includes(value.source)) {
+    return false;
+  }
+
+  if (value.displayName !== undefined && typeof value.displayName !== 'string') {
+    return false;
+  }
+
+  if (value.rawPrompt !== undefined && typeof value.rawPrompt !== 'string') {
+    return false;
+  }
+
+  if (value.requireExplicitMention !== undefined && typeof value.requireExplicitMention !== 'boolean') {
+    return false;
+  }
+
+  if (value.mentionDetected !== undefined && typeof value.mentionDetected !== 'boolean') {
+    return false;
+  }
+
+  return true;
+}
+
+function sanitizeDailyRoomName(roomId: string): string {
+  const normalized = roomId
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+  return `ai-canvas-${normalized || 'room'}`.slice(0, 60);
+}
+
+function normalizeDisplayName(value: unknown, sessionId: string): string {
+  if (typeof value !== 'string') {
+    return `User-${sessionId.slice(-4)}`;
+  }
+  const cleaned = value.trim().replace(/\s{2,}/g, ' ');
+  if (!cleaned) {
+    return `User-${sessionId.slice(-4)}`;
+  }
+  return cleaned.slice(0, 48);
+}
+
+async function ensureDailyRoom(roomName: string, apiKey: string): Promise<string> {
+  const createResponse = await fetch(`${dailyApiBaseUrl}/rooms`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      name: roomName,
+      privacy: 'private',
+      properties: {
+        start_video_off: true,
+      },
+    }),
+  });
+
+  if (createResponse.ok) {
+    const created = (await createResponse.json()) as { url?: string };
+    if (typeof created.url === 'string' && created.url.length > 0) {
+      return created.url;
+    }
+  }
+
+  if (createResponse.status !== 409) {
+    const bodyText = await createResponse.text();
+    throw new Error(`Daily room creation failed (${createResponse.status}): ${bodyText.slice(0, 220)}`);
+  }
+
+  const fetchResponse = await fetch(`${dailyApiBaseUrl}/rooms/${encodeURIComponent(roomName)}`, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: 'application/json',
+    },
+  });
+  if (!fetchResponse.ok) {
+    const bodyText = await fetchResponse.text();
+    throw new Error(`Daily room lookup failed (${fetchResponse.status}): ${bodyText.slice(0, 220)}`);
+  }
+
+  const existing = (await fetchResponse.json()) as { url?: string };
+  if (typeof existing.url !== 'string' || existing.url.length === 0) {
+    throw new Error('Daily room lookup did not return a room URL.');
+  }
+  return existing.url;
+}
+
+async function createDailyMeetingToken(
+  roomName: string,
+  displayName: string,
+  apiKey: string,
+): Promise<{ token?: string; expiresAt: string }> {
+  const expiresAtEpoch = Math.floor(Date.now() / 1000) + 4 * 60 * 60;
+  const response = await fetch(`${dailyApiBaseUrl}/meeting-tokens`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      properties: {
+        room_name: roomName,
+        user_name: displayName,
+        exp: expiresAtEpoch,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const bodyText = await response.text();
+    throw new Error(`Daily token generation failed (${response.status}): ${bodyText.slice(0, 220)}`);
+  }
+
+  const payload = (await response.json()) as { token?: string };
+  return {
+    token: payload.token,
+    expiresAt: new Date(expiresAtEpoch * 1000).toISOString(),
+  };
+}
+
 export function isAgentTurnRequest(value: unknown): value is AgentTurnRequest {
   if (!isObject(value)) {
     return false;
@@ -44,7 +179,8 @@ export function isAgentTurnRequest(value: unknown): value is AgentTurnRequest {
     typeof value.context.viewport.y === 'number' &&
     typeof value.context.viewport.width === 'number' &&
     typeof value.context.viewport.height === 'number' &&
-    typeof value.context.maxShapes === 'number'
+    typeof value.context.maxShapes === 'number' &&
+    isValidInvocation(value.invocation)
   );
 }
 
@@ -52,7 +188,10 @@ export async function handleAgentTurn(request: AgentTurnRequest) {
   return streamGeminiTurn(request);
 }
 
-export const backendPort = 3001;
+export const backendPort = (() => {
+  const configured = Number(getEnv('PORT') ?? getEnv('BACKEND_PORT') ?? 3001);
+  return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 3001;
+})();
 
 export function createBackendHealth() {
   return {
@@ -241,6 +380,30 @@ export async function startBackendServer(options: StartBackendServerOptions = {}
         return;
       }
 
+      if (payload.prompt.trim().length === 0) {
+        writeJson(response, 400, {
+          accepted: false,
+          failure: {
+            code: 'invalid_request',
+            message: 'Prompt cannot be empty.',
+            retryable: false,
+          },
+        });
+        return;
+      }
+
+      if (!payload.invocation?.mentionDetected) {
+        writeJson(response, 400, {
+          accepted: false,
+          failure: {
+            code: 'invalid_request',
+            message: 'AI commands require an explicit @agent mention.',
+            retryable: false,
+          },
+        });
+        return;
+      }
+
       const sessionKey = `${payload.roomId}:${payload.sessionId}`;
       const nowMs = Date.now();
       const minTurnIntervalMs = getMinTurnIntervalMs();
@@ -320,6 +483,52 @@ export async function startBackendServer(options: StartBackendServerOptions = {}
       }
 
       response.end();
+      return;
+    }
+
+    if (request.method === 'POST' && request.url === '/voice/room') {
+      let payload: unknown;
+      try {
+        const body = await readRequestBody(request);
+        payload = parseJsonBody(body);
+      } catch {
+        writeJson(response, 400, {
+          error: 'Request body must be valid JSON.',
+        });
+        return;
+      }
+
+      if (!isObject(payload) || typeof payload.roomId !== 'string' || typeof payload.sessionId !== 'string') {
+        writeJson(response, 400, {
+          error: 'roomId and sessionId are required.',
+        });
+        return;
+      }
+
+      const apiKey = getEnv('DAILY_API_KEY');
+      if (!apiKey) {
+        writeJson(response, 501, {
+          error: 'Voice provider is not configured. Set DAILY_API_KEY on backend.',
+        });
+        return;
+      }
+
+      const roomName = sanitizeDailyRoomName(payload.roomId);
+      const userDisplayName = normalizeDisplayName(payload.displayName, payload.sessionId);
+      try {
+        const roomUrl = await ensureDailyRoom(roomName, apiKey);
+        const tokenPayload = await createDailyMeetingToken(roomName, userDisplayName, apiKey);
+        writeJson(response, 200, {
+          provider: 'daily',
+          roomUrl,
+          token: tokenPayload.token,
+          expiresAt: tokenPayload.expiresAt,
+        });
+      } catch (error) {
+        writeJson(response, 502, {
+          error: error instanceof Error ? error.message : 'Failed to initialize voice room.',
+        });
+      }
       return;
     }
 

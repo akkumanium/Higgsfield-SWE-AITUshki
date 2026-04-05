@@ -1,4 +1,4 @@
-export declare const syncServerPort = 3002;
+export declare const syncServerPort: number;
 export interface SyncRoomRecord {
     roomId: string;
     connectedClients: number;

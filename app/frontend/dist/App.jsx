@@ -15,6 +15,8 @@ const DEFAULT_GEO_W = 160;
 const DEFAULT_GEO_H = 80;
 const MEDIA_POLL_INTERVAL_MS = 3_500;
 const MEDIA_POLL_MAX_RETRIES = 120;
+const OVERLAY_MARGIN_PX = 12;
+const OVERLAY_WIDTH_PX = 360;
 function createId(prefix) {
     return `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
 }
@@ -33,26 +35,38 @@ function parseRoomAndSessionFromUrl() {
         return {
             roomId: defaultRoomId,
             sessionId: defaultSessionId,
+            displayName: 'User',
         };
     }
     const params = new URLSearchParams(window.location.search);
     const roomFromUrl = params.get('room');
     const sessionFromUrl = params.get('session');
+    const nameFromUrl = params.get('name');
     const sessionFromStorage = window.sessionStorage.getItem('ai-canvas-session-id');
+    const nameFromStorage = window.localStorage.getItem('ai-canvas-display-name');
     const roomId = roomFromUrl && roomFromUrl.trim().length > 0 ? roomFromUrl : defaultRoomId;
     const sessionId = (sessionFromUrl && sessionFromUrl.trim().length > 0
         ? sessionFromUrl
         : sessionFromStorage && sessionFromStorage.trim().length > 0
             ? sessionFromStorage
             : `${defaultSessionId}-${Math.random().toString(36).slice(2, 10)}`);
+    const fallbackName = `User-${sessionId.slice(-4)}`;
+    const displayName = (nameFromUrl && nameFromUrl.trim().length > 0
+        ? nameFromUrl.trim()
+        : nameFromStorage && nameFromStorage.trim().length > 0
+            ? nameFromStorage.trim()
+            : fallbackName).slice(0, 48);
     params.set('room', roomId);
     params.set('session', sessionId);
+    params.set('name', displayName);
     const nextUrl = `${window.location.pathname}?${params.toString()}${window.location.hash}`;
     window.history.replaceState({}, '', nextUrl);
     window.sessionStorage.setItem('ai-canvas-session-id', sessionId);
+    window.localStorage.setItem('ai-canvas-display-name', displayName);
     return {
         roomId,
         sessionId,
+        displayName,
     };
 }
 function isShapeRecord(record) {
@@ -408,9 +422,11 @@ export function App(root, options = {}) {
     const urlResolved = parseRoomAndSessionFromUrl();
     const roomId = options.roomId ?? urlResolved.roomId;
     const sessionId = options.sessionId ?? urlResolved.sessionId;
+    const displayName = options.displayName ?? urlResolved.displayName;
     const backendUrl = options.backendUrl ?? 'http://localhost:3001';
     const sync = createSyncConnection(roomId, sessionId, {
         url: options.syncUrl,
+        displayName,
     });
     root.innerHTML = '';
     root.style.position = root.style.position || 'relative';
@@ -419,59 +435,101 @@ export function App(root, options = {}) {
     root.appendChild(mountNode);
     const overlay = document.createElement('aside');
     overlay.style.position = 'absolute';
-    overlay.style.top = '12px';
-    overlay.style.right = '12px';
-    overlay.style.width = '320px';
+    overlay.style.top = `${OVERLAY_MARGIN_PX}px`;
+    overlay.style.right = `${OVERLAY_MARGIN_PX}px`;
+    overlay.style.width = `${OVERLAY_WIDTH_PX}px`;
+    overlay.style.maxWidth = `calc(100vw - ${OVERLAY_MARGIN_PX * 2}px)`;
     overlay.style.padding = '12px';
-    overlay.style.borderRadius = '10px';
-    overlay.style.background = 'rgba(255, 255, 255, 0.94)';
-    overlay.style.boxShadow = '0 10px 28px rgba(15, 23, 42, 0.16)';
+    overlay.style.borderRadius = '12px';
+    overlay.style.border = '1px solid #dbe3ed';
+    overlay.style.background = 'linear-gradient(180deg, rgba(255, 255, 255, 0.97) 0%, rgba(248, 250, 252, 0.97) 100%)';
+    overlay.style.boxShadow = '0 12px 32px rgba(15, 23, 42, 0.18)';
     overlay.style.fontFamily = 'Segoe UI, sans-serif';
     overlay.style.pointerEvents = 'auto';
     overlay.style.zIndex = '40';
+    const dragHeader = document.createElement('div');
+    dragHeader.style.display = 'flex';
+    dragHeader.style.alignItems = 'center';
+    dragHeader.style.justifyContent = 'space-between';
+    dragHeader.style.marginBottom = '8px';
+    dragHeader.style.padding = '2px 2px 6px 2px';
+    dragHeader.style.borderBottom = '1px solid #e2e8f0';
+    dragHeader.style.cursor = 'grab';
+    dragHeader.style.userSelect = 'none';
+    dragHeader.style.touchAction = 'none';
     const title = document.createElement('div');
-    title.textContent = 'AI Agent';
+    title.textContent = 'Room Chat + AI';
     title.style.fontSize = '14px';
     title.style.fontWeight = '700';
-    title.style.marginBottom = '8px';
+    const dragHint = document.createElement('div');
+    dragHint.textContent = 'drag';
+    dragHint.style.fontSize = '11px';
+    dragHint.style.fontWeight = '600';
+    dragHint.style.textTransform = 'uppercase';
+    dragHint.style.letterSpacing = '0.08em';
+    dragHint.style.color = '#64748b';
+    dragHeader.appendChild(title);
+    dragHeader.appendChild(dragHint);
+    const metaCard = document.createElement('div');
+    metaCard.style.display = 'grid';
+    metaCard.style.gap = '4px';
+    metaCard.style.marginBottom = '8px';
+    metaCard.style.padding = '8px 10px';
+    metaCard.style.border = '1px solid #dbe2ea';
+    metaCard.style.borderRadius = '8px';
+    metaCard.style.background = 'rgba(248, 250, 252, 0.9)';
     const roomMeta = document.createElement('div');
     roomMeta.textContent = `room: ${roomId}`;
-    roomMeta.style.fontSize = '12px';
+    roomMeta.style.fontSize = '11px';
+    roomMeta.style.fontWeight = '600';
     roomMeta.style.color = '#334155';
     const sessionMeta = document.createElement('div');
     sessionMeta.textContent = `session: ${sessionId}`;
-    sessionMeta.style.fontSize = '12px';
+    sessionMeta.style.fontSize = '11px';
     sessionMeta.style.color = '#334155';
-    sessionMeta.style.marginBottom = '8px';
+    const userMeta = document.createElement('div');
+    userMeta.textContent = `you: ${displayName}`;
+    userMeta.style.fontSize = '11px';
+    userMeta.style.color = '#334155';
+    const participantsMeta = document.createElement('div');
+    participantsMeta.textContent = 'participants: 1';
+    participantsMeta.style.fontSize = '11px';
+    participantsMeta.style.color = '#334155';
+    metaCard.appendChild(roomMeta);
+    metaCard.appendChild(sessionMeta);
+    metaCard.appendChild(userMeta);
+    metaCard.appendChild(participantsMeta);
     const syncBadge = document.createElement('div');
     syncBadge.style.display = 'inline-block';
-    syncBadge.style.padding = '4px 8px';
+    syncBadge.style.padding = '5px 9px';
     syncBadge.style.borderRadius = '999px';
-    syncBadge.style.fontSize = '12px';
+    syncBadge.style.fontSize = '11px';
     syncBadge.style.fontWeight = '600';
-    syncBadge.style.marginBottom = '10px';
+    syncBadge.style.marginBottom = '9px';
     const input = document.createElement('textarea');
-    input.placeholder = 'Ask agent to place notes, draw arrows, cluster, or summarize';
+    input.placeholder = 'Chat with the room. Use @agent to run AI commands.';
     input.style.width = '100%';
     input.style.minHeight = '72px';
     input.style.resize = 'vertical';
     input.style.boxSizing = 'border-box';
-    input.style.padding = '8px';
-    input.style.border = '1px solid #cbd5e1';
+    input.style.padding = '9px 10px';
+    input.style.border = '1px solid #bfccd9';
     input.style.borderRadius = '8px';
     input.style.fontSize = '13px';
+    input.style.background = '#ffffff';
+    input.style.color = '#0f172a';
     input.style.marginBottom = '8px';
-    const triggerButton = document.createElement('button');
-    triggerButton.type = 'button';
-    triggerButton.textContent = 'Run agent';
-    triggerButton.style.width = '100%';
-    triggerButton.style.padding = '9px 10px';
-    triggerButton.style.border = 'none';
-    triggerButton.style.borderRadius = '8px';
-    triggerButton.style.background = '#0f766e';
-    triggerButton.style.color = '#ffffff';
-    triggerButton.style.fontWeight = '600';
-    triggerButton.style.cursor = 'pointer';
+    const sendButton = document.createElement('button');
+    sendButton.type = 'button';
+    sendButton.textContent = 'Send message';
+    sendButton.style.width = '100%';
+    sendButton.style.padding = '10px 10px';
+    sendButton.style.border = 'none';
+    sendButton.style.borderRadius = '8px';
+    sendButton.style.background = 'linear-gradient(180deg, #0f766e 0%, #115e59 100%)';
+    sendButton.style.color = '#ffffff';
+    sendButton.style.fontWeight = '600';
+    sendButton.style.cursor = 'pointer';
     const cancelButton = document.createElement('button');
     cancelButton.type = 'button';
     cancelButton.textContent = 'Cancel request';
@@ -491,92 +549,341 @@ export function App(root, options = {}) {
     statusLine.style.color = '#475569';
     const chatOutput = document.createElement('div');
     chatOutput.style.marginTop = '8px';
-    chatOutput.style.maxHeight = '120px';
+    chatOutput.style.maxHeight = '220px';
     chatOutput.style.overflowY = 'auto';
+    chatOutput.style.display = 'flex';
+    chatOutput.style.flexDirection = 'column';
+    chatOutput.style.gap = '6px';
     chatOutput.style.padding = '8px';
-    chatOutput.style.border = '1px solid #cbd5e1';
-    chatOutput.style.borderRadius = '8px';
-    chatOutput.style.background = '#f8fafc';
+    chatOutput.style.border = '1px solid #d4dde7';
+    chatOutput.style.borderRadius = '10px';
+    chatOutput.style.background = 'linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%)';
     chatOutput.style.fontSize = '12px';
     chatOutput.style.color = '#0f172a';
-    chatOutput.style.whiteSpace = 'pre-wrap';
     chatOutput.style.wordBreak = 'break-word';
     const errorLine = document.createElement('div');
     errorLine.style.marginTop = '6px';
     errorLine.style.fontSize = '12px';
     errorLine.style.color = '#b91c1c';
     const helper = document.createElement('div');
-    helper.textContent = 'Tip: include @agent in a text shape or use this panel.';
+    helper.textContent = 'Tip: users always receive messages; AI only runs when @agent is included.';
     helper.style.marginTop = '8px';
     helper.style.fontSize = '11px';
-    helper.style.color = '#64748b';
+    helper.style.color = '#5b6778';
+    const voiceTitle = document.createElement('div');
+    voiceTitle.textContent = 'Voice room (Daily)';
+    voiceTitle.style.marginTop = '10px';
+    voiceTitle.style.fontSize = '12px';
+    voiceTitle.style.fontWeight = '700';
+    voiceTitle.style.color = '#0f172a';
+    const voiceControls = document.createElement('div');
+    voiceControls.style.display = 'grid';
+    voiceControls.style.gridTemplateColumns = '1fr 1fr 1fr';
+    voiceControls.style.gap = '6px';
+    voiceControls.style.marginTop = '6px';
+    const voiceJoinButton = document.createElement('button');
+    voiceJoinButton.type = 'button';
+    voiceJoinButton.textContent = 'Join';
+    voiceJoinButton.style.padding = '7px 8px';
+    voiceJoinButton.style.border = '1px solid #94a3b8';
+    voiceJoinButton.style.borderRadius = '8px';
+    voiceJoinButton.style.background = '#ffffff';
+    voiceJoinButton.style.cursor = 'pointer';
+    const voiceMuteButton = document.createElement('button');
+    voiceMuteButton.type = 'button';
+    voiceMuteButton.textContent = 'Mute';
+    voiceMuteButton.style.padding = '7px 8px';
+    voiceMuteButton.style.border = '1px solid #94a3b8';
+    voiceMuteButton.style.borderRadius = '8px';
+    voiceMuteButton.style.background = '#ffffff';
+    voiceMuteButton.style.cursor = 'pointer';
+    voiceMuteButton.disabled = true;
+    const voiceLeaveButton = document.createElement('button');
+    voiceLeaveButton.type = 'button';
+    voiceLeaveButton.textContent = 'Leave';
+    voiceLeaveButton.style.padding = '7px 8px';
+    voiceLeaveButton.style.border = '1px solid #94a3b8';
+    voiceLeaveButton.style.borderRadius = '8px';
+    voiceLeaveButton.style.background = '#ffffff';
+    voiceLeaveButton.style.cursor = 'pointer';
+    voiceLeaveButton.disabled = true;
+    const voiceStatus = document.createElement('div');
+    voiceStatus.textContent = 'Voice disconnected';
+    voiceStatus.style.marginTop = '6px';
+    voiceStatus.style.fontSize = '11px';
+    voiceStatus.style.color = '#475569';
+    voiceControls.appendChild(voiceJoinButton);
+    voiceControls.appendChild(voiceMuteButton);
+    voiceControls.appendChild(voiceLeaveButton);
     const updateSyncBadge = (state) => {
         syncBadge.textContent = syncStateLabel(state);
         syncBadge.style.background = syncStateColor(state);
         syncBadge.style.color = '#ffffff';
     };
     updateSyncBadge(sync);
-    const triggerFromPanel = () => {
-        const prompt = input.value.trim();
-        if (prompt.length === 0) {
-            return;
-        }
-        window.dispatchEvent(createAgentTriggerEvent({
-            roomId,
-            sessionId,
-            prompt,
-        }));
-        input.value = '';
-    };
-    const onInputKeydown = (event) => {
-        if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
-            event.preventDefault();
-            triggerFromPanel();
-        }
-    };
-    triggerButton.addEventListener('click', triggerFromPanel);
-    input.addEventListener('keydown', onInputKeydown);
-    overlay.appendChild(title);
-    overlay.appendChild(roomMeta);
-    overlay.appendChild(sessionMeta);
+    overlay.appendChild(dragHeader);
+    overlay.appendChild(metaCard);
     overlay.appendChild(syncBadge);
     overlay.appendChild(input);
-    overlay.appendChild(triggerButton);
+    overlay.appendChild(sendButton);
     overlay.appendChild(cancelButton);
     overlay.appendChild(statusLine);
     overlay.appendChild(chatOutput);
     overlay.appendChild(errorLine);
     overlay.appendChild(helper);
+    overlay.appendChild(voiceTitle);
+    overlay.appendChild(voiceControls);
+    overlay.appendChild(voiceStatus);
     root.appendChild(overlay);
+    let dragPointerId = null;
+    let dragOffsetX = 0;
+    let dragOffsetY = 0;
+    const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
+    const getClampedOverlayPosition = (left, top) => {
+        const maxLeft = Math.max(OVERLAY_MARGIN_PX, root.clientWidth - overlay.offsetWidth - OVERLAY_MARGIN_PX);
+        const maxTop = Math.max(OVERLAY_MARGIN_PX, root.clientHeight - overlay.offsetHeight - OVERLAY_MARGIN_PX);
+        return {
+            left: clamp(left, OVERLAY_MARGIN_PX, maxLeft),
+            top: clamp(top, OVERLAY_MARGIN_PX, maxTop),
+        };
+    };
+    const moveOverlay = (left, top) => {
+        const next = getClampedOverlayPosition(left, top);
+        overlay.style.right = 'auto';
+        overlay.style.left = `${next.left}px`;
+        overlay.style.top = `${next.top}px`;
+    };
+    const ensureOverlayUsesLeftTop = () => {
+        if (overlay.style.right === 'auto') {
+            return;
+        }
+        const overlayRect = overlay.getBoundingClientRect();
+        const rootRect = root.getBoundingClientRect();
+        moveOverlay(overlayRect.left - rootRect.left, overlayRect.top - rootRect.top);
+    };
+    const onOverlayDragStart = (event) => {
+        if (event.pointerType === 'mouse' && event.button !== 0) {
+            return;
+        }
+        ensureOverlayUsesLeftTop();
+        const overlayRect = overlay.getBoundingClientRect();
+        dragOffsetX = event.clientX - overlayRect.left;
+        dragOffsetY = event.clientY - overlayRect.top;
+        dragPointerId = event.pointerId;
+        dragHeader.style.cursor = 'grabbing';
+        dragHeader.setPointerCapture(event.pointerId);
+        event.preventDefault();
+    };
+    const onOverlayDragMove = (event) => {
+        if (dragPointerId === null || event.pointerId !== dragPointerId) {
+            return;
+        }
+        const rootRect = root.getBoundingClientRect();
+        const left = event.clientX - rootRect.left - dragOffsetX;
+        const top = event.clientY - rootRect.top - dragOffsetY;
+        moveOverlay(left, top);
+    };
+    const onOverlayDragEnd = (event) => {
+        if (dragPointerId === null || event.pointerId !== dragPointerId) {
+            return;
+        }
+        dragHeader.releasePointerCapture(event.pointerId);
+        dragPointerId = null;
+        dragHeader.style.cursor = 'grab';
+    };
+    const onWindowResize = () => {
+        ensureOverlayUsesLeftTop();
+        const left = Number.parseFloat(overlay.style.left);
+        const top = Number.parseFloat(overlay.style.top);
+        moveOverlay(Number.isFinite(left) ? left : OVERLAY_MARGIN_PX, Number.isFinite(top) ? top : OVERLAY_MARGIN_PX);
+    };
+    dragHeader.addEventListener('pointerdown', onOverlayDragStart);
+    dragHeader.addEventListener('pointermove', onOverlayDragMove);
+    dragHeader.addEventListener('pointerup', onOverlayDragEnd);
+    dragHeader.addEventListener('pointercancel', onOverlayDragEnd);
+    onWindowResize();
+    window.addEventListener('resize', onWindowResize);
     let editor = null;
     let applyingRemoteAction = false;
     let lastTriggerSignature = '';
     let lastTriggerAt = 0;
     let isAgentRequestInFlight = false;
     let inFlightController = null;
+    let activeAgentChatMessageId = null;
+    let voiceCall = null;
+    let voiceConnected = false;
+    let voiceMuted = false;
     const appliedRemoteActionIds = new Set();
+    const chatMessages = [];
     let isDisposed = false;
     const mediaPollTimers = new Map();
     const mediaPollAttempts = new Map();
     const mediaShapeByRequestId = new Map();
+    const formatChatTimestamp = (value) => {
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) {
+            return '--:--';
+        }
+        return date.toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+        });
+    };
+    const renderChatMessages = () => {
+        chatOutput.replaceChildren();
+        if (chatMessages.length === 0) {
+            const emptyState = document.createElement('div');
+            emptyState.textContent = 'Messages from this room will appear here.';
+            emptyState.style.padding = '8px';
+            emptyState.style.fontSize = '11px';
+            emptyState.style.color = '#64748b';
+            emptyState.style.border = '1px dashed #cbd5e1';
+            emptyState.style.borderRadius = '8px';
+            emptyState.style.textAlign = 'center';
+            chatOutput.appendChild(emptyState);
+            return;
+        }
+        for (const message of chatMessages) {
+            const isAgentMessage = message.displayName.toLowerCase() === 'agent' || message.mentionsAgent;
+            const messageCard = document.createElement('div');
+            messageCard.style.border = isAgentMessage ? '1px solid #bae6fd' : '1px solid #dbe3ed';
+            messageCard.style.background = isAgentMessage ? '#f0f9ff' : '#ffffff';
+            messageCard.style.borderRadius = '8px';
+            messageCard.style.padding = '7px 8px';
+            const messageMeta = document.createElement('div');
+            messageMeta.textContent = `${message.displayName}${message.mentionsAgent ? ' • @agent' : ''} • ${formatChatTimestamp(message.createdAt)}`;
+            messageMeta.style.fontSize = '10px';
+            messageMeta.style.fontWeight = '700';
+            messageMeta.style.color = '#1e293b';
+            messageMeta.style.marginBottom = '3px';
+            const messageBody = document.createElement('div');
+            messageBody.textContent = message.text.length > 0 ? message.text : '...';
+            messageBody.style.fontSize = '12px';
+            messageBody.style.lineHeight = '1.35';
+            messageBody.style.color = '#0f172a';
+            messageBody.style.whiteSpace = 'pre-wrap';
+            messageCard.appendChild(messageMeta);
+            messageCard.appendChild(messageBody);
+            chatOutput.appendChild(messageCard);
+        }
+        chatOutput.scrollTop = chatOutput.scrollHeight;
+    };
+    renderChatMessages();
+    const pushChatMessage = (message) => {
+        const existingIndex = chatMessages.findIndex((entry) => entry.id === message.id);
+        if (existingIndex >= 0) {
+            chatMessages[existingIndex] = message;
+        }
+        else {
+            chatMessages.push(message);
+            if (chatMessages.length > 140) {
+                chatMessages.splice(0, chatMessages.length - 140);
+            }
+        }
+        renderChatMessages();
+    };
+    const updateParticipantsMeta = (participants) => {
+        const names = participants.map((participant) => participant.displayName).slice(0, 6);
+        const extraCount = participants.length > names.length ? ` +${participants.length - names.length}` : '';
+        participantsMeta.textContent = `participants (${participants.length}): ${names.join(', ')}${extraCount}`;
+    };
+    updateParticipantsMeta([
+        {
+            roomId,
+            sessionId,
+            displayName,
+            joinedAt: new Date().toISOString(),
+            lastSeenAt: new Date().toISOString(),
+        },
+    ]);
+    const updateVoiceButtons = () => {
+        voiceJoinButton.disabled = voiceConnected;
+        voiceMuteButton.disabled = !voiceConnected;
+        voiceLeaveButton.disabled = !voiceConnected;
+        voiceMuteButton.textContent = voiceMuted ? 'Unmute' : 'Mute';
+        voiceStatus.textContent = voiceConnected
+            ? `Voice connected (${voiceMuted ? 'muted' : 'live'})`
+            : 'Voice disconnected';
+    };
+    updateVoiceButtons();
+    const dispatchAgentTrigger = (rawText, source) => {
+        const match = detectAgentTrigger(rawText);
+        if (!match.hasTrigger) {
+            return false;
+        }
+        window.dispatchEvent(createAgentTriggerEvent({
+            roomId,
+            sessionId,
+            source,
+            displayName,
+            rawPrompt: rawText,
+            mentionDetected: true,
+            prompt: match.cleanedText,
+        }));
+        return true;
+    };
+    const triggerFromPanel = () => {
+        const message = input.value.trim();
+        if (message.length === 0) {
+            return;
+        }
+        const triggerMatch = detectAgentTrigger(message);
+        const sent = sync.sendChatMessage(message, triggerMatch.hasTrigger);
+        if (!sent) {
+            errorLine.textContent = 'Unable to send message while sync is disconnected.';
+            return;
+        }
+        errorLine.textContent = '';
+        input.value = '';
+        if (triggerMatch.hasTrigger) {
+            dispatchAgentTrigger(message, 'chat');
+        }
+    };
+    const onInputKeydown = (event) => {
+        if (event.key === 'Enter' && !event.shiftKey) {
+            event.preventDefault();
+            triggerFromPanel();
+        }
+    };
+    sendButton.addEventListener('click', triggerFromPanel);
+    input.addEventListener('keydown', onInputKeydown);
     const setAgentUiState = (busy, status, error = '') => {
         isAgentRequestInFlight = busy;
         statusLine.textContent = status;
         errorLine.textContent = error;
-        triggerButton.disabled = busy;
-        triggerButton.style.opacity = busy ? '0.65' : '1';
-        triggerButton.style.cursor = busy ? 'default' : 'pointer';
+        sendButton.disabled = busy;
+        sendButton.style.opacity = busy ? '0.75' : '1';
+        sendButton.style.cursor = busy ? 'default' : 'pointer';
         cancelButton.style.display = busy ? 'block' : 'none';
     };
-    const resetAgentChatText = () => {
-        chatOutput.textContent = '';
+    const resetAgentChatText = (turnId) => {
+        activeAgentChatMessageId = `agent-${turnId}`;
+        pushChatMessage({
+            id: activeAgentChatMessageId,
+            roomId,
+            sessionId,
+            displayName: 'Agent',
+            text: '',
+            mentionsAgent: true,
+            createdAt: new Date().toISOString(),
+        });
     };
     const appendAgentChatText = (delta) => {
         if (delta.length === 0) {
             return;
         }
-        chatOutput.textContent = `${chatOutput.textContent ?? ''}${delta}`;
-        chatOutput.scrollTop = chatOutput.scrollHeight;
+        const messageId = activeAgentChatMessageId ?? `agent-${createId('stream')}`;
+        activeAgentChatMessageId = messageId;
+        const existing = chatMessages.find((entry) => entry.id === messageId);
+        pushChatMessage({
+            id: messageId,
+            roomId,
+            sessionId,
+            displayName: 'Agent',
+            text: `${existing?.text ?? ''}${delta}`,
+            mentionsAgent: true,
+            createdAt: existing?.createdAt ?? new Date().toISOString(),
+        });
     };
     const clearMediaPoll = (requestId, clearShapeMapping = false) => {
         const timerId = mediaPollTimers.get(requestId);
@@ -790,11 +1097,16 @@ export function App(root, options = {}) {
             });
             sync.sendAction(createAction);
             if (isTextualShape(addedRecord)) {
-                const match = detectAgentTrigger(addedRecord.props.text);
+                const rawText = addedRecord.props.text;
+                const match = detectAgentTrigger(rawText);
                 if (match.hasTrigger) {
                     window.dispatchEvent(createAgentTriggerEvent({
                         roomId,
                         sessionId,
+                        source: 'canvas',
+                        displayName,
+                        rawPrompt: rawText,
+                        mentionDetected: true,
                         prompt: match.cleanedText,
                     }));
                 }
@@ -812,11 +1124,16 @@ export function App(root, options = {}) {
             });
             sync.sendAction(updateAction);
             if (isTextualShape(nextShape)) {
-                const match = detectAgentTrigger(nextShape.props.text);
+                const rawText = nextShape.props.text;
+                const match = detectAgentTrigger(rawText);
                 if (match.hasTrigger) {
                     window.dispatchEvent(createAgentTriggerEvent({
                         roomId,
                         sessionId,
+                        source: 'canvas',
+                        displayName,
+                        rawPrompt: rawText,
+                        mentionDetected: true,
                         prompt: match.cleanedText,
                     }));
                 }
@@ -1074,6 +1391,94 @@ export function App(root, options = {}) {
     const removeActionListener = sync.onAction((action) => {
         applyRemote(action);
     });
+    const removeChatListener = sync.onChat((chat) => {
+        pushChatMessage(chat);
+    });
+    const removePresenceListener = sync.onPresence((participants) => {
+        updateParticipantsMeta(participants);
+    });
+    const createDailyCallObject = async () => {
+        const dailyModule = await import('@daily-co/daily-js');
+        const candidate = dailyModule;
+        const factory = candidate.createCallObject ?? candidate.default?.createCallObject;
+        if (typeof factory !== 'function') {
+            throw new Error('Daily SDK failed to initialize.');
+        }
+        return factory();
+    };
+    const joinVoiceRoom = async () => {
+        if (voiceConnected) {
+            return;
+        }
+        voiceStatus.textContent = 'Connecting voice...';
+        try {
+            const response = await fetch(`${backendUrl}/voice/room`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Accept: 'application/json',
+                },
+                body: JSON.stringify({
+                    roomId,
+                    sessionId,
+                    displayName,
+                }),
+            });
+            if (!response.ok) {
+                const body = (await response.json());
+                throw new Error(body.failure?.message ?? body.error ?? `Voice setup failed (${response.status})`);
+            }
+            const payload = (await response.json());
+            if (payload.provider !== 'daily' || typeof payload.roomUrl !== 'string') {
+                throw new Error('Voice provider returned invalid room data.');
+            }
+            voiceCall = voiceCall ?? (await createDailyCallObject());
+            await voiceCall.join({
+                url: payload.roomUrl,
+                token: payload.token,
+            });
+            voiceCall.setLocalAudio(true);
+            voiceConnected = true;
+            voiceMuted = false;
+            updateVoiceButtons();
+        }
+        catch (error) {
+            voiceConnected = false;
+            voiceMuted = false;
+            updateVoiceButtons();
+            voiceStatus.textContent = error instanceof Error ? error.message : 'Failed to connect voice.';
+        }
+    };
+    const leaveVoiceRoom = async () => {
+        if (!voiceCall || !voiceConnected) {
+            return;
+        }
+        try {
+            await voiceCall.leave();
+        }
+        finally {
+            voiceConnected = false;
+            voiceMuted = false;
+            updateVoiceButtons();
+        }
+    };
+    const toggleVoiceMute = () => {
+        if (!voiceCall || !voiceConnected) {
+            return;
+        }
+        voiceMuted = !voiceMuted;
+        voiceCall.setLocalAudio(!voiceMuted);
+        updateVoiceButtons();
+    };
+    const onVoiceJoinClick = () => {
+        void joinVoiceRoom();
+    };
+    const onVoiceLeaveClick = () => {
+        void leaveVoiceRoom();
+    };
+    voiceJoinButton.addEventListener('click', onVoiceJoinClick);
+    voiceMuteButton.addEventListener('click', toggleVoiceMute);
+    voiceLeaveButton.addEventListener('click', onVoiceLeaveClick);
     const onAgentTrigger = async (event) => {
         if (!editor) {
             return;
@@ -1083,15 +1488,20 @@ export function App(root, options = {}) {
         if (!detail || detail.roomId !== roomId || detail.sessionId !== sessionId) {
             return;
         }
+        if (!detail.mentionDetected) {
+            setAgentUiState(false, 'Ready', 'AI commands require @agent mention.');
+            return;
+        }
         const normalizedPrompt = detail.prompt.trim();
         if (normalizedPrompt.length === 0) {
+            setAgentUiState(false, 'Ready', 'Provide text after @agent to run AI.');
             return;
         }
         if (isAgentRequestInFlight) {
             setAgentUiState(true, 'Agent is already running...', '');
             return;
         }
-        const signature = `${detail.sessionId}:${normalizedPrompt}`;
+        const signature = `${detail.sessionId}:${detail.source}:${normalizedPrompt}`;
         const now = Date.now();
         if (signature === lastTriggerSignature && now - lastTriggerAt < 800) {
             return;
@@ -1111,16 +1521,24 @@ export function App(root, options = {}) {
             viewport,
             maxShapes: 120,
         }, shapeSnapshots);
+        const turnId = createId('turn');
         const requestPayload = {
             roomId,
             sessionId,
-            turnId: createId('turn'),
+            turnId,
             prompt: normalizedPrompt,
             context,
+            invocation: {
+                source: detail.source,
+                displayName: detail.displayName ?? displayName,
+                rawPrompt: detail.rawPrompt,
+                requireExplicitMention: true,
+                mentionDetected: detail.mentionDetected,
+            },
         };
         const controller = new AbortController();
         inFlightController = controller;
-        resetAgentChatText();
+        resetAgentChatText(turnId);
         setAgentUiState(true, 'Agent running...', '');
         try {
             const response = await fetch(`${backendUrl}/agent/turn`, {
@@ -1175,6 +1593,7 @@ export function App(root, options = {}) {
             setAgentUiState(false, 'Ready', 'Agent request failed due to a network error.');
         }
         finally {
+            activeAgentChatMessageId = null;
             inFlightController = null;
             if (isAgentRequestInFlight) {
                 setAgentUiState(false, 'Ready', errorLine.textContent ?? '');
@@ -1202,12 +1621,25 @@ export function App(root, options = {}) {
         dispose() {
             isDisposed = true;
             clearAllMediaPolls();
-            triggerButton.removeEventListener('click', triggerFromPanel);
+            dragHeader.removeEventListener('pointerdown', onOverlayDragStart);
+            dragHeader.removeEventListener('pointermove', onOverlayDragMove);
+            dragHeader.removeEventListener('pointerup', onOverlayDragEnd);
+            dragHeader.removeEventListener('pointercancel', onOverlayDragEnd);
+            window.removeEventListener('resize', onWindowResize);
+            sendButton.removeEventListener('click', triggerFromPanel);
             cancelButton.removeEventListener('click', onCancelRequest);
             input.removeEventListener('keydown', onInputKeydown);
+            voiceJoinButton.removeEventListener('click', onVoiceJoinClick);
+            voiceMuteButton.removeEventListener('click', toggleVoiceMute);
+            voiceLeaveButton.removeEventListener('click', onVoiceLeaveClick);
             window.removeEventListener(agentTriggerEventName, onAgentTrigger);
             removeStateListener();
             removeActionListener();
+            removeChatListener();
+            removePresenceListener();
+            void leaveVoiceRoom();
+            voiceCall?.destroy?.();
+            voiceCall = null;
             sync.disconnect(1000, 'App disposed');
             appRoot.unmount();
             overlay.remove();

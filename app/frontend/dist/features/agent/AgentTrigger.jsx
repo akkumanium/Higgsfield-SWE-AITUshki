@@ -15,6 +15,10 @@ export function createAgentTriggerEvent(detail) {
         detail: {
             roomId: detail.roomId,
             sessionId: detail.sessionId,
+            source: detail.source,
+            displayName: detail.displayName,
+            rawPrompt: detail.rawPrompt,
+            mentionDetected: detail.mentionDetected,
             prompt: normalizeAgentPrompt(detail.prompt),
         },
     });

@@ -3,6 +3,7 @@ export declare const defaultSessionId = "demo-session";
 export interface AppOptions {
     roomId?: string;
     sessionId?: string;
+    displayName?: string;
     syncUrl?: string;
     backendUrl?: string;
 }

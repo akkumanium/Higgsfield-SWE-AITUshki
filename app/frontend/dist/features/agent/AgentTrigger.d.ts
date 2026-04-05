@@ -6,6 +6,10 @@ export interface AgentTriggerMatch {
 export interface AgentTriggerDetail {
     roomId: string;
     sessionId: string;
+    source: 'chat' | 'canvas' | 'panel';
+    displayName?: string;
+    rawPrompt: string;
+    mentionDetected: boolean;
     prompt: string;
 }
 export declare const agentTriggerEventName = "ai-canvas.agent-trigger";

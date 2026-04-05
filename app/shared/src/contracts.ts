@@ -1,6 +1,7 @@
 export type RoomId = string;
 export type SessionId = string;
 export type AgentTurnId = string;
+export type DisplayName = string;
 
 export type CanvasShapeId = string;
 export type CanvasActionId = string;
@@ -47,11 +48,30 @@ export interface SyncConnectionState {
   error?: string;
 }
 
+export interface RoomParticipant {
+  roomId: RoomId;
+  sessionId: SessionId;
+  displayName: DisplayName;
+  joinedAt: string;
+  lastSeenAt: string;
+}
+
+export interface ChatMessageEnvelope {
+  id: MessageId;
+  roomId: RoomId;
+  sessionId: SessionId;
+  displayName: DisplayName;
+  text: string;
+  mentionsAgent: boolean;
+  createdAt: string;
+}
+
 export interface SyncClientJoinMessage {
   type: 'join';
   messageId: MessageId;
   roomId: RoomId;
   sessionId: SessionId;
+  displayName?: DisplayName;
 }
 
 export interface SyncClientActionMessage {
@@ -68,18 +88,33 @@ export interface SyncClientPresencePingMessage {
   messageId: MessageId;
   roomId: RoomId;
   sessionId: SessionId;
+  displayName?: DisplayName;
+  at: string;
+}
+
+export interface SyncClientChatMessage {
+  type: 'chat.send';
+  messageId: MessageId;
+  roomId: RoomId;
+  sessionId: SessionId;
+  displayName?: DisplayName;
+  text: string;
+  mentionsAgent: boolean;
   at: string;
 }
 
 export type SyncClientMessage =
   | SyncClientJoinMessage
   | SyncClientActionMessage
-  | SyncClientPresencePingMessage;
+  | SyncClientPresencePingMessage
+  | SyncClientChatMessage;
 
 export interface SyncServerSnapshotMessage {
   type: 'room.snapshot';
   roomId: RoomId;
   actions: CanvasActionEnvelope[];
+  recentChats: ChatMessageEnvelope[];
+  participants: RoomParticipant[];
   connectedClients: number;
 }
 
@@ -105,6 +140,13 @@ export interface SyncServerPresenceMessage {
   type: 'room.presence';
   roomId: RoomId;
   connectedClients: number;
+  participants: RoomParticipant[];
+}
+
+export interface SyncServerChatMessage {
+  type: 'room.chat';
+  roomId: RoomId;
+  chat: ChatMessageEnvelope;
 }
 
 export interface SyncServerErrorMessage {
@@ -120,6 +162,7 @@ export type SyncServerMessage =
   | SyncServerActionMessage
   | SyncServerActionAckMessage
   | SyncServerPresenceMessage
+  | SyncServerChatMessage
   | SyncServerErrorMessage;
 
 export type CanvasShapeKind = 'text' | 'sticky' | 'arrow' | 'cluster' | 'image' | 'unknown';
@@ -210,6 +253,13 @@ export interface AgentTurnRequest {
   turnId: AgentTurnId;
   prompt: string;
   context: AgentContextRequest;
+  invocation?: {
+    source: 'chat' | 'canvas' | 'panel';
+    displayName?: DisplayName;
+    rawPrompt?: string;
+    requireExplicitMention?: boolean;
+    mentionDetected?: boolean;
+  };
   metadata?: RequestMetadata;
 }
 

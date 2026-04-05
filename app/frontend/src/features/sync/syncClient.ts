@@ -1,7 +1,10 @@
 import type {
+  ChatMessageEnvelope,
   CanvasActionEnvelope,
   FailureEnvelope,
+  RoomParticipant,
   SyncClientActionMessage,
+  SyncClientChatMessage,
   SyncClientJoinMessage,
   SyncClientMessage,
   SyncClientPresencePingMessage,
@@ -14,9 +17,12 @@ export interface SyncConnectionState extends SharedSyncConnectionState {}
 
 type SyncStateListener = (state: SyncConnectionState) => void;
 type SyncActionListener = (action: CanvasActionEnvelope) => void;
+type SyncChatListener = (chat: ChatMessageEnvelope) => void;
+type SyncPresenceListener = (participants: RoomParticipant[]) => void;
 
 export interface SyncConnectionOptions {
   url?: string;
+  displayName?: string;
   pingIntervalMs?: number;
   maxQueuedActions?: number;
   maxRetryAttempts?: number;
@@ -26,8 +32,11 @@ export interface SyncConnection extends SyncConnectionState {
   connect: () => void;
   disconnect: (code?: number, reason?: string) => void;
   sendAction: (action: CanvasActionEnvelope) => boolean;
+  sendChatMessage: (text: string, mentionsAgent: boolean) => boolean;
   onStateChange: (listener: SyncStateListener) => () => void;
   onAction: (listener: SyncActionListener) => () => void;
+  onChat: (listener: SyncChatListener) => () => void;
+  onPresence: (listener: SyncPresenceListener) => () => void;
 }
 
 const defaultSyncUrl = 'ws://localhost:3002';
@@ -72,6 +81,8 @@ export function createSyncConnection(
 ): SyncConnection {
   const stateListeners = new Set<SyncStateListener>();
   const actionListeners = new Set<SyncActionListener>();
+  const chatListeners = new Set<SyncChatListener>();
+  const presenceListeners = new Set<SyncPresenceListener>();
 
   let socket: WebSocket | null = null;
   let pingInterval: ReturnType<typeof setInterval> | null = null;
@@ -79,12 +90,14 @@ export function createSyncConnection(
   let shouldReconnect = true;
 
   const syncUrl = options.url ?? defaultSyncUrl;
+  const displayName = options.displayName?.trim() || `User-${sessionId.slice(-4)}`;
   const pingIntervalMs = options.pingIntervalMs ?? defaultPingIntervalMs;
   const maxQueuedActions = options.maxQueuedActions ?? defaultMaxQueuedActions;
   const maxRetryAttempts = options.maxRetryAttempts ?? defaultMaxRetryAttempts;
 
   const pendingActions = new Map<string, PendingActionRecord>();
   const seenIncomingActionIds = new Set<string>();
+  const seenIncomingChatIds = new Set<string>();
 
   const state: SyncConnectionState = {
     roomId,
@@ -100,6 +113,7 @@ export function createSyncConnection(
     connect,
     disconnect,
     sendAction,
+    sendChatMessage,
     onStateChange(listener) {
       stateListeners.add(listener);
       return () => stateListeners.delete(listener);
@@ -108,7 +122,47 @@ export function createSyncConnection(
       actionListeners.add(listener);
       return () => actionListeners.delete(listener);
     },
+    onChat(listener) {
+      chatListeners.add(listener);
+      return () => chatListeners.delete(listener);
+    },
+    onPresence(listener) {
+      presenceListeners.add(listener);
+      return () => presenceListeners.delete(listener);
+    },
   };
+
+  function emitChat(chat: ChatMessageEnvelope) {
+    if (seenIncomingChatIds.has(chat.id)) {
+      return;
+    }
+    seenIncomingChatIds.add(chat.id);
+    if (seenIncomingChatIds.size > maxQueuedActions * 4) {
+      seenIncomingChatIds.clear();
+    }
+    for (const listener of chatListeners) {
+      listener(chat);
+    }
+  }
+
+  function emitPresence(participants: RoomParticipant[]) {
+    for (const listener of presenceListeners) {
+      listener(participants);
+    }
+  }
+
+  function emitAction(action: CanvasActionEnvelope) {
+    if (seenIncomingActionIds.has(action.id)) {
+      return;
+    }
+    seenIncomingActionIds.add(action.id);
+    if (seenIncomingActionIds.size > maxQueuedActions * 4) {
+      seenIncomingActionIds.clear();
+    }
+    for (const listener of actionListeners) {
+      listener(action);
+    }
+  }
 
   function publishState(nextState: SyncConnectionState) {
     Object.assign(state, nextState);
@@ -156,6 +210,7 @@ export function createSyncConnection(
         messageId: createId('ping'),
         roomId,
         sessionId,
+        displayName,
         at: new Date().toISOString(),
       };
       if (isBrowserWebSocketReady(socket)) {
@@ -165,17 +220,29 @@ export function createSyncConnection(
   }
 
   function handleServerMessage(message: SyncServerMessage) {
+    if (message.type === 'room.snapshot' && message.roomId === roomId) {
+      for (const action of message.actions) {
+        emitAction(action);
+      }
+      for (const chat of message.recentChats) {
+        emitChat(chat);
+      }
+      emitPresence(message.participants);
+      return;
+    }
+
     if (message.type === 'room.action' && message.roomId === roomId) {
-      if (seenIncomingActionIds.has(message.action.id)) {
-        return;
-      }
-      seenIncomingActionIds.add(message.action.id);
-      if (seenIncomingActionIds.size > maxQueuedActions * 4) {
-        seenIncomingActionIds.clear();
-      }
-      for (const listener of actionListeners) {
-        listener(message.action);
-      }
+      emitAction(message.action);
+      return;
+    }
+
+    if (message.type === 'room.chat' && message.roomId === roomId) {
+      emitChat(message.chat);
+      return;
+    }
+
+    if (message.type === 'room.presence' && message.roomId === roomId) {
+      emitPresence(message.participants);
       return;
     }
 
@@ -262,6 +329,7 @@ export function createSyncConnection(
         messageId: createId('join'),
         roomId,
         sessionId,
+        displayName,
       };
 
       publishState(setSyncConnected(state));
@@ -321,6 +389,27 @@ export function createSyncConnection(
     }
 
     return dispatchPendingAction(action.id) || !isBrowserWebSocketReady(socket);
+  }
+
+  function sendChatMessage(text: string, mentionsAgent: boolean): boolean {
+    const normalizedText = text.trim();
+    if (normalizedText.length === 0 || !isBrowserWebSocketReady(socket)) {
+      return false;
+    }
+
+    const message: SyncClientChatMessage = {
+      type: 'chat.send',
+      messageId: createId('chat-msg'),
+      roomId,
+      sessionId,
+      displayName,
+      text: normalizedText,
+      mentionsAgent,
+      at: new Date().toISOString(),
+    };
+
+    socket.send(toClientMessageString(message));
+    return true;
   }
 
   return connection;

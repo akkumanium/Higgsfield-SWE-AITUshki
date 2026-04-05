@@ -27,16 +27,20 @@ function toClientMessageString(message) {
 export function createSyncConnection(roomId, sessionId = 'local-session', options = {}) {
     const stateListeners = new Set();
     const actionListeners = new Set();
+    const chatListeners = new Set();
+    const presenceListeners = new Set();
     let socket = null;
     let pingInterval = null;
     let reconnectTimer = null;
     let shouldReconnect = true;
     const syncUrl = options.url ?? defaultSyncUrl;
+    const displayName = options.displayName?.trim() || `User-${sessionId.slice(-4)}`;
     const pingIntervalMs = options.pingIntervalMs ?? defaultPingIntervalMs;
     const maxQueuedActions = options.maxQueuedActions ?? defaultMaxQueuedActions;
     const maxRetryAttempts = options.maxRetryAttempts ?? defaultMaxRetryAttempts;
     const pendingActions = new Map();
     const seenIncomingActionIds = new Set();
+    const seenIncomingChatIds = new Set();
     const state = {
         roomId,
         sessionId,
@@ -50,6 +54,7 @@ export function createSyncConnection(roomId, sessionId = 'local-session', option
         connect,
         disconnect,
         sendAction,
+        sendChatMessage,
         onStateChange(listener) {
             stateListeners.add(listener);
             return () => stateListeners.delete(listener);
@@ -58,7 +63,44 @@ export function createSyncConnection(roomId, sessionId = 'local-session', option
             actionListeners.add(listener);
             return () => actionListeners.delete(listener);
         },
+        onChat(listener) {
+            chatListeners.add(listener);
+            return () => chatListeners.delete(listener);
+        },
+        onPresence(listener) {
+            presenceListeners.add(listener);
+            return () => presenceListeners.delete(listener);
+        },
     };
+    function emitChat(chat) {
+        if (seenIncomingChatIds.has(chat.id)) {
+            return;
+        }
+        seenIncomingChatIds.add(chat.id);
+        if (seenIncomingChatIds.size > maxQueuedActions * 4) {
+            seenIncomingChatIds.clear();
+        }
+        for (const listener of chatListeners) {
+            listener(chat);
+        }
+    }
+    function emitPresence(participants) {
+        for (const listener of presenceListeners) {
+            listener(participants);
+        }
+    }
+    function emitAction(action) {
+        if (seenIncomingActionIds.has(action.id)) {
+            return;
+        }
+        seenIncomingActionIds.add(action.id);
+        if (seenIncomingActionIds.size > maxQueuedActions * 4) {
+            seenIncomingActionIds.clear();
+        }
+        for (const listener of actionListeners) {
+            listener(action);
+        }
+    }
     function publishState(nextState) {
         Object.assign(state, nextState);
         Object.assign(connection, nextState);
@@ -99,6 +141,7 @@ export function createSyncConnection(roomId, sessionId = 'local-session', option
                 messageId: createId('ping'),
                 roomId,
                 sessionId,
+                displayName,
                 at: new Date().toISOString(),
             };
             if (isBrowserWebSocketReady(socket)) {
@@ -107,17 +150,26 @@ export function createSyncConnection(roomId, sessionId = 'local-session', option
         }, pingIntervalMs);
     }
     function handleServerMessage(message) {
+        if (message.type === 'room.snapshot' && message.roomId === roomId) {
+            for (const action of message.actions) {
+                emitAction(action);
+            }
+            for (const chat of message.recentChats) {
+                emitChat(chat);
+            }
+            emitPresence(message.participants);
+            return;
+        }
         if (message.type === 'room.action' && message.roomId === roomId) {
-            if (seenIncomingActionIds.has(message.action.id)) {
-                return;
-            }
-            seenIncomingActionIds.add(message.action.id);
-            if (seenIncomingActionIds.size > maxQueuedActions * 4) {
-                seenIncomingActionIds.clear();
-            }
-            for (const listener of actionListeners) {
-                listener(message.action);
-            }
+            emitAction(message.action);
+            return;
+        }
+        if (message.type === 'room.chat' && message.roomId === roomId) {
+            emitChat(message.chat);
+            return;
+        }
+        if (message.type === 'room.presence' && message.roomId === roomId) {
+            emitPresence(message.participants);
             return;
         }
         if (isActionAckMessage(message) && message.roomId === roomId) {
@@ -192,6 +244,7 @@ export function createSyncConnection(roomId, sessionId = 'local-session', option
                 messageId: createId('join'),
                 roomId,
                 sessionId,
+                displayName,
             };
             publishState(setSyncConnected(state));
             socket?.send(toClientMessageString(joinMessage));
@@ -244,6 +297,24 @@ export function createSyncConnection(roomId, sessionId = 'local-session', option
             });
         }
         return dispatchPendingAction(action.id) || !isBrowserWebSocketReady(socket);
+    }
+    function sendChatMessage(text, mentionsAgent) {
+        const normalizedText = text.trim();
+        if (normalizedText.length === 0 || !isBrowserWebSocketReady(socket)) {
+            return false;
+        }
+        const message = {
+            type: 'chat.send',
+            messageId: createId('chat-msg'),
+            roomId,
+            sessionId,
+            displayName,
+            text: normalizedText,
+            mentionsAgent,
+            at: new Date().toISOString(),
+        };
+        socket.send(toClientMessageString(message));
+        return true;
     }
     return connection;
 }

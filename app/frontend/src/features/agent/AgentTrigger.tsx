@@ -7,6 +7,10 @@ export interface AgentTriggerMatch {
 export interface AgentTriggerDetail {
   roomId: string;
   sessionId: string;
+  source: 'chat' | 'canvas' | 'panel';
+  displayName?: string;
+  rawPrompt: string;
+  mentionDetected: boolean;
   prompt: string;
 }
 
@@ -30,6 +34,10 @@ export function createAgentTriggerEvent(detail: AgentTriggerDetail): CustomEvent
     detail: {
       roomId: detail.roomId,
       sessionId: detail.sessionId,
+      source: detail.source,
+      displayName: detail.displayName,
+      rawPrompt: detail.rawPrompt,
+      mentionDetected: detail.mentionDetected,
       prompt: normalizeAgentPrompt(detail.prompt),
     },
   });
