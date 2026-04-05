@@ -358,6 +358,19 @@ function groupEditorShapes(editor: Editor, shapeIds: string[], options?: { group
   maybe.groupShapes?.(shapeIds, options);
 }
 
+function runEditorAsRemoteChange(editor: Editor, mutate: () => void) {
+  const maybeStore = editor.store as unknown as {
+    mergeRemoteChanges?: (callback: () => void) => void;
+  };
+
+  if (typeof maybeStore.mergeRemoteChanges === 'function') {
+    maybeStore.mergeRemoteChanges(mutate);
+    return;
+  }
+
+  mutate();
+}
+
 function normalizeMediaStatus(value: unknown): MediaStatus {
   if (typeof value !== 'string') {
     return 'failed';
@@ -1486,8 +1499,9 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
     applyingRemoteAction = true;
     const mediaRequestsToRegister: MediaRequestPayload[] = [];
     try {
-      activeEditor.run(() => {
-        for (const operation of plan.operations) {
+      runEditorAsRemoteChange(activeEditor, () => {
+        activeEditor.run(() => {
+          for (const operation of plan.operations) {
           if (operation.kind === 'create') {
             const shapeInput = operation.payload.shapeInput;
             if (shapeInput && typeof shapeInput === 'object') {
@@ -1711,6 +1725,7 @@ export function App(root: HTMLElement, options: AppOptions = {}): MountedApp {
             }
           }
         }
+        });
       });
 
       for (const mediaRequest of mediaRequestsToRegister) {
