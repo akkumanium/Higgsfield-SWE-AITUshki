@@ -806,8 +806,101 @@ const VALID_COLORS = new Set<string>([
 
 function stripMarkdownFences(value: string): string {
   const trimmed = value.trim();
-  const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-  return match?.[1] !== undefined ? match[1].trim() : trimmed;
+  const exactFenceMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (exactFenceMatch?.[1] !== undefined) {
+    return exactFenceMatch[1].trim();
+  }
+
+  const firstFenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  return firstFenceMatch?.[1] !== undefined ? firstFenceMatch[1].trim() : trimmed;
+}
+
+function extractFirstBalancedJsonObject(value: string): string | null {
+  const input = value.trim();
+  const start = input.indexOf('{');
+  if (start < 0) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < input.length; index += 1) {
+    const char = input[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === '{') {
+      depth += 1;
+      continue;
+    }
+
+    if (char === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return input.slice(start, index + 1);
+      }
+      if (depth < 0) {
+        return null;
+      }
+    }
+  }
+
+  return null;
+}
+
+interface ParsedJsonResult {
+  parsed: unknown;
+  text: string;
+  strategy: 'stripped' | 'balanced_stripped' | 'balanced_raw';
+}
+
+function parseModelJsonOutput(rawText: string): ParsedJsonResult | null {
+  const stripped = stripMarkdownFences(rawText);
+  const attempts: Array<{ strategy: ParsedJsonResult['strategy']; text: string }> = [
+    { strategy: 'stripped', text: stripped },
+  ];
+
+  const balancedFromStripped = extractFirstBalancedJsonObject(stripped);
+  if (balancedFromStripped) {
+    attempts.push({ strategy: 'balanced_stripped', text: balancedFromStripped });
+  }
+
+  const balancedFromRaw = extractFirstBalancedJsonObject(rawText);
+  if (balancedFromRaw && balancedFromRaw !== balancedFromStripped) {
+    attempts.push({ strategy: 'balanced_raw', text: balancedFromRaw });
+  }
+
+  for (const attempt of attempts) {
+    if (!attempt.text.trim()) {
+      continue;
+    }
+
+    try {
+      return {
+        parsed: JSON.parse(attempt.text),
+        text: attempt.text,
+        strategy: attempt.strategy,
+      };
+    } catch {
+      // Try the next parsing strategy.
+    }
+  }
+
+  return null;
 }
 
 interface PlanValidationTrace {
@@ -1345,6 +1438,7 @@ async function callPlannerAI(
     generationConfig: {
       temperature: 0.3,
       maxOutputTokens,
+      responseMimeType: 'application/json',
     },
     systemInstruction: {
       parts: [{ text: systemPrompt }],
@@ -1468,13 +1562,25 @@ async function callPlannerAI(
       candidateCount: body.candidates?.length ?? 0,
     });
 
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(strippedText);
-    } catch (error) {
+    if (!rawText) {
+      logPlanner('warn', 'planner.response.model_text_empty', {
+        turnId: request.turnId,
+        body,
+      });
+      return {
+        plan: buildFallbackPlan(request.prompt, request.context.viewport),
+        fallbackFailure: {
+          code: 'provider_error',
+          message: 'Planner returned an empty response. Showing fallback.',
+          retryable: true,
+        },
+      };
+    }
+
+    const parsedResult = parseModelJsonOutput(rawText);
+    if (!parsedResult) {
       logPlanner('warn', 'planner.response.model_text_invalid_json', {
         turnId: request.turnId,
-        parseError: serializeError(error),
         rawText,
         strippedText,
       });
@@ -1487,6 +1593,14 @@ async function callPlannerAI(
         },
       };
     }
+
+    logPlanner('info', 'planner.response.model_text_parsed', {
+      turnId: request.turnId,
+      strategy: parsedResult.strategy,
+      normalizedText: parsedResult.text,
+    });
+
+    const parsed = parsedResult.parsed;
 
     const validationTrace = createPlanValidationTrace(parsed);
     const plan = sanitizeAndValidatePlan(parsed, request.context.viewport, maxNodes, contextShapes, validationTrace);
