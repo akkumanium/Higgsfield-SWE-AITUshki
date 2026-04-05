@@ -97,6 +97,7 @@ export function createSyncConnection(
 
   const pendingActions = new Map<string, PendingActionRecord>();
   const seenIncomingActionIds = new Set<string>();
+  const maxSeenActions = defaultMaxQueuedActions * 8; // Keep more history to prevent duplicates
   const seenIncomingChatIds = new Set<string>();
 
   const state: SyncConnectionState = {
@@ -137,8 +138,12 @@ export function createSyncConnection(
       return;
     }
     seenIncomingChatIds.add(chat.id);
+    // Maintain a bounded dedup cache using FIFO eviction
     if (seenIncomingChatIds.size > maxQueuedActions * 4) {
-      seenIncomingChatIds.clear();
+      const oldestChatId = seenIncomingChatIds.values().next().value;
+      if (typeof oldestChatId === 'string') {
+        seenIncomingChatIds.delete(oldestChatId);
+      }
     }
     for (const listener of chatListeners) {
       listener(chat);
@@ -156,8 +161,12 @@ export function createSyncConnection(
       return;
     }
     seenIncomingActionIds.add(action.id);
-    if (seenIncomingActionIds.size > maxQueuedActions * 4) {
-      seenIncomingActionIds.clear();
+    // Maintain a bounded dedup cache using FIFO eviction to prevent replay attacks
+    if (seenIncomingActionIds.size > maxSeenActions) {
+      const oldestActionId = seenIncomingActionIds.values().next().value;
+      if (typeof oldestActionId === 'string') {
+        seenIncomingActionIds.delete(oldestActionId);
+      }
     }
     for (const listener of actionListeners) {
       listener(action);

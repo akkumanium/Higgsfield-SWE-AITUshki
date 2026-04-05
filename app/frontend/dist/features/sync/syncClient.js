@@ -40,6 +40,7 @@ export function createSyncConnection(roomId, sessionId = 'local-session', option
     const maxRetryAttempts = options.maxRetryAttempts ?? defaultMaxRetryAttempts;
     const pendingActions = new Map();
     const seenIncomingActionIds = new Set();
+    const maxSeenActions = defaultMaxQueuedActions * 8; // Keep more history to prevent duplicates
     const seenIncomingChatIds = new Set();
     const state = {
         roomId,
@@ -95,7 +96,11 @@ export function createSyncConnection(roomId, sessionId = 'local-session', option
         }
         seenIncomingActionIds.add(action.id);
         if (seenIncomingActionIds.size > maxQueuedActions * 4) {
+            // Remove oldest seen action IDs to maintain bounded size (FIFO eviction)
+            // Instead of clearing all, remove about 1/4 of the oldest entries
+            const idsToKeep = Array.from(seenIncomingActionIds).slice(Math.floor(seenIncomingActionIds.size / 4));
             seenIncomingActionIds.clear();
+            idsToKeep.forEach((id) => seenIncomingActionIds.add(id));
         }
         for (const listener of actionListeners) {
             listener(action);
